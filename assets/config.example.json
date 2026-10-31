@@ -1,0 +1,82 @@
+{
+  "schema_version": 5,
+  "services": {
+    "moviepilot": {
+      "name": "moviepilot",
+      "base_url": "https://moviepilot.example.invalid",
+      "token_env": "MOVIEPILOT_TOKEN",
+      "auth_mode": "x-api-key",
+      "media_source": "tmdb",
+      "subscription_sources": ["admin", "Bangumi订阅"]
+    },
+    "cloud": {
+      "name": "p115",
+      "credential_env": "P115_COOKIE",
+      "root_directory_path": "/<cloud-root>"
+    },
+    "litepan": {
+      "name": "litepan",
+      "base_url": "https://litepan.example.invalid",
+      "api_key_env": "LITEPAN_API_KEY",
+      "task_name": "anime-strm"
+    },
+    "emby": {
+      "name": "emby",
+      "base_url": "https://emby.example.invalid",
+      "api_key_env": "EMBY_API_KEY",
+      "library_name": "Anime"
+    }
+  },
+  "source": {
+    "name": "kisssub",
+    "kind": "kisssub",
+    "base_url": "https://source.example.invalid"
+  },
+  "paths": {
+    "cloud_source_root": "/<cloud-root>/source",
+    "cloud_library_root": "/<cloud-root>/library",
+    "cloud_library_subdir": "整理",
+    "litepan_output_root": "/<litepan-output-root>",
+    "litepan_raw_output_root": "/<litepan-task-host-output-root>",
+    "moviepilot_mount_root": "/<moviepilot-mount-root>",
+    "emby_mount_root": "/<emby-mount-root>",
+    "state_directory": "/<state-directory>"
+  },
+  "discovery": {"anime_guard": {"enabled": true}},
+  "scoring": {
+    "include_weight": 10,
+    "language_weight": 5,
+    "release_group_weight": 3,
+    "resolution_weight": 2,
+    "collection_penalty": 4
+  },
+  "limits": {
+    "network_timeout_seconds": 30,
+    "max_read_retries": 3,
+    "max_task_pages": 20,
+    "max_recursive_depth": 8,
+    "max_recursive_files": 1000,
+    "max_new_tasks_per_run": 4,
+    "max_new_tasks_per_subscription": 2,
+    "global_submission_limit": 4,
+    "per_subscription_submission_limit": 2,
+    "max_review_batch": 50,
+    "max_reconcile_batch": 50,
+    "max_cloud_checks_per_run": 8
+  },
+  "retry": {
+    "max_attempts": 3,
+    "backoff_seconds": 1,
+    "backoff_max_seconds": 30,
+    "jitter_seconds": 0.25
+  },
+  "runtime": {
+    "litepan_task_name": "anime-strm",
+    "emby_library_name": "Anime",
+    "reconcile_batch": 50
+  },
+  "schedule": {
+    "timezone": "Asia/Shanghai",
+    "cron": "0 2 * * *"
+  }
+}
