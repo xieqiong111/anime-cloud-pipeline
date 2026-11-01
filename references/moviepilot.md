@@ -13,6 +13,7 @@ The implemented endpoints are:
 | Method | Endpoint | Use |
 |---|---|---|
 | GET | `/api/v1/subscribe/` | subscription snapshot |
+| GET | `/api/v1/tmdb/{media_id}/{season}` | unpaginated season episode calendar for automatic catch-up |
 | GET | `/api/v1/system/env` | version metadata |
 | POST | `/api/v1/storage/list` | bounded storage listing |
 | POST | `/api/v1/storage/download` | read exact file content |
@@ -30,6 +31,14 @@ detail, library lookup accepts its endpoint result, and plugin methods handle
 their mapping/list results. There is no generic envelope contract for those
 endpoints. A response body, cookie, API key, or query token is never copied
 into a persisted diagnostic.
+
+The season calendar accepts the endpoint's bare list or a successful `data` list
+envelope with a matching total when provided. Pagination envelopes, rejected
+authentication, empty results, duplicate episode identities, wrong seasons, and
+invalid dates cannot be treated as missing episodes. The route and its list
+contract follow the [MoviePilot TMDB API implementation](https://github.com/jxxghp/MoviePilot/blob/v3/app/api/endpoints/tmdb.py).
+Live availability with the instance's configured authentication must be checked
+by a read-only `dry-run` before enabling actual catch-up in that environment.
 
 ## Host and container mount view
 

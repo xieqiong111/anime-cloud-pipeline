@@ -121,6 +121,18 @@ class SidecarEvidence:
         self.secrets = tuple(secrets)
 
     def validate(self, episode: Any) -> EvidenceResult:
+        return self._inspect(episode, classify_existing=False)
+
+    def classify_existing(self, episode: Any) -> EvidenceResult:
+        """Classify existing sidecars without requiring an entire scrape bundle.
+
+        Every present NFO is still checked for contradictions. Show identity
+        anchors shared show assets; season and episode assets additionally
+        require their corresponding NFO identities. Absence proves no media.
+        """
+        return self._inspect(episode, classify_existing=True)
+
+    def _inspect(self, episode: Any, *, classify_existing: bool) -> EvidenceResult:
         strm_path = _episode_value(
             episode, "strm_path", "litepan_path", "moviepilot_path", "emby_path"
         )
@@ -264,6 +276,26 @@ class SidecarEvidence:
             mismatch = _check_season_nfo(values["season_nfo"], expected_season)
             if mismatch is not None:
                 return self._metadata_conflict(paths["season_nfo"], mismatch)
+
+        if classify_existing:
+            verified = {}
+            if "tvshow_nfo" in values:
+                for name in ("tvshow_nfo", "tvshow_poster"):
+                    if name in values:
+                        verified[name] = paths[name]
+                if "season_nfo" in values:
+                    for name in ("season_nfo", "season_poster"):
+                        if name in values:
+                            verified[name] = paths[name]
+                    if "episode_nfo" in values:
+                        for name in ("episode_nfo", "episode_image"):
+                            if name in values:
+                                verified[name] = paths[name]
+            return EvidenceResult(True, detail={
+                "reason": "existing_sidecars_classified",
+                "paths_by_role": {name: _safe_path(path, self.secrets)
+                                  for name, path in verified.items()},
+            })
 
         if missing:
             return EvidenceResult(

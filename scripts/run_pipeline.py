@@ -120,6 +120,9 @@ class _ReadOnlyStore:
             return self._rows("SELECT * FROM episodes_v5 WHERE status=? ORDER BY id", (stage,))
         return self._rows("SELECT * FROM episodes_v5 ORDER BY id")
 
+    def subscriptions(self) -> list[dict[str, Any]]:
+        return self._rows("SELECT * FROM subscriptions ORDER BY id")
+
     def list_open_reviews(self) -> list[dict[str, Any]]:
         return self._rows(
             """SELECT * FROM episodes_v5
@@ -831,9 +834,8 @@ def _parse_backfill(value: str | None) -> tuple[str, int, int, int] | None:
 
 
 def _window(args: argparse.Namespace, config: ConfigSchema) -> dict[str, Any]:
-    today = dt.datetime.now(dt.timezone.utc).astimezone(
-        ZoneInfo(config.schedule.timezone)
-    ).date()
+    now = dt.datetime.now(dt.timezone.utc).astimezone(ZoneInfo(config.schedule.timezone))
+    today = now.date()
     quarter_month = ((today.month - 1) // 3) * 3 + 1
     window: dict[str, Any] = {"season_quarter": f"{today.year:04d}-{quarter_month:02d}"}
     if getattr(args, "previous_day", False):
@@ -848,6 +850,11 @@ def _window(args: argparse.Namespace, config: ConfigSchema) -> dict[str, Any]:
             "start": start,
             "end": end,
         }
+    elif not getattr(args, "previous_day", False) and not getattr(args, "resume_only", False):
+        window.update(
+            auto_backfill=True,
+            as_of_date=today.isoformat(),
+        )
     return window
 
 
@@ -1244,7 +1251,14 @@ def _dry_run_details(plan: Any, secrets: tuple[str, ...]) -> dict[str, Any]:
         )}
         item["infohash_sha256"] = hashlib.sha256(str(row.get("infohash") or "").encode()).hexdigest()
         decisions.append(item)
-    return {"subscription_details": subscriptions, "decision_details": decisions}
+    return {
+        "subscription_details": subscriptions,
+        "decision_details": decisions,
+        "error_details": [{key: text(value) for key, value in error.to_mapping().items()}
+                          for error in plan.errors],
+        "exclusion_details": [{key: text(value) for key, value in item.to_mapping().items()}
+                              for item in plan.exclusions],
+    }
 
 
 def cmd_dry_run(args: argparse.Namespace) -> int:
@@ -1254,21 +1268,20 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
     with stage("runtime"):
         runtime = build_runtime(config, writable=False)
     guard = build_discovery_guard(_raw)
-    discovery = DiscoveryService(
-        None,
-        runtime.moviepilot,
-        runtime.providers,
-        config=config,
-        secrets=_secret_values(config),
-        guard=guard,
-    )
-    if guard is not None:
+    snapshots = ()
+    if guard is not None or window.get("auto_backfill"):
         with stage("state.snapshot"):
             store = _open_readonly(config)
             try:
-                guard.bind(store.all_episodes() if store is not None else [])
+                if guard is not None:
+                    guard.bind(store.all_episodes() if store is not None else [])
+                snapshots = tuple(store.subscriptions()) if store is not None else ()
             finally:
                 _close_store(store)
+    discovery = DiscoveryService(
+        None, runtime.moviepilot, runtime.providers, config=config,
+        secrets=_secret_values(config), guard=guard, subscription_snapshots=snapshots,
+    )
     with stage("discovery"):
         plan = discovery.prepare(window, read_only=True)
     summary = dict(plan.summary)
@@ -1281,6 +1294,8 @@ def cmd_dry_run(args: argparse.Namespace) -> int:
         "excluded": int(summary.get("excluded_count", 0)),
         "guard": guard.describe() if guard is not None else None,
     }
+    if "backfill" in summary:
+        report["backfill"] = summary["backfill"]
     if getattr(args, "details", False):
         report.update(_dry_run_details(plan, _secret_values(config)))
     _json_output(report)

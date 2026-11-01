@@ -3,6 +3,41 @@
 This changelog separates reusable source changes, offline checks, and bounded
 deployment evidence. A successful deployment does not certify another instance.
 
+## Unreleased — subscription catch-up and inventory ownership (2026-11-01)
+
+- Ordinary authorized runs discover aired episodes of eligible current-quarter
+  subscriptions and search historical sources when RSS does not cover them.
+  Calendar validation, bounded query budgets and saved cursors preserve the
+  existing identity, anime and season-premiere gates. Explicit backfill and
+  resume scopes remain bounded; this change installs no new trigger or scheduler.
+- Classify canonical raw/published STRM, episode sidecars and shared show/season
+  artwork through selected remote-file identities, PathMapper and validated NFO
+  anchors. Raw links require matching published content. Shared artwork does not
+  have to belong exclusively to one episode, and metadata never proves episode
+  presence by itself.
+- Reject global remote-ID/path ownership conflicts, unknown files, symlinks,
+  escaped paths, incomplete inventories and exhausted caps. Bound text reads and
+  compare no-follow file snapshots including ctime before and after validation.
+- Preserve an explicitly resolved duplicate-candidate choice only while the
+  selected candidate remains eligible and agrees with the durable review.
+  Invalid or changed choices return to review rather than choosing an alternative.
+
+Validation: 188 targeted isolated inventory, scope, selection, receipt, lock and
+related regression tests passed on local Python 3.12 and NAS Python 3.12.4.
+An authorized five-episode workflow reached exact Emby identity/path acceptance:
+four new submissions, one per missing episode, with no resubmission of the
+existing episode. All five raw/published STRM pairs and complete sidecar bundles
+were verified. Existing scheduler and out-of-scope episode rows were preserved.
+
+This is bounded manual-run evidence. Actual playback, subscription-time automatic
+triggering and historical-source requests absent from RSS were not validated by
+that workflow; the 188-test result does not establish automatic catch-up coverage.
+The earlier read-only catch-up preview had `history_queries=0`, and dedicated
+automatic catch-up tests remain `NOT_RUN`.
+Private configurations, databases, NAS operation scripts and live evidence remain
+outside the public repository. Earlier full-suite baseline failures below remain
+disclosed; no new full-suite-green claim is made.
+
 ## 5.4.5 — independent V5 runtime and quarter preparation
 
 - Add subscription qualification, read-only resource planning, and explicitly

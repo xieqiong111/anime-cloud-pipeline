@@ -450,9 +450,9 @@ class CandidateSelector:
     ) -> SelectionResult:
         """Score all candidates and select one unique semantic winner.
 
-        A semantic tie clears all previous selections and opens a duplicate
-        review.  The state-store operation performs that clear and review in
-        one SQLite transaction.
+        A valid resolved duplicate review retains its explicit choice after
+        eligibility checks. Otherwise a semantic tie clears selections and
+        opens a duplicate review in one state-store transaction.
         """
 
         resolved_id = self._episode_id(episode_id)
@@ -478,6 +478,43 @@ class CandidateSelector:
             for row, score in zip(rows, scores)
             if not score.excluded
         ]
+        if episode.get("review_reason") == ReviewReason.DUPLICATE_EPISODE.value:
+            # The review transaction already selected the operator's choice.
+            # Re-scoring must validate it, not replace it with another tie.
+            resolution = episode.get("review_resolution")
+            if isinstance(resolution, str):
+                try:
+                    resolution = json.loads(resolution)
+                except ValueError:
+                    resolution = None
+            choices = [resolution[key] for key in ("selected_candidate_id", "candidate_id")
+                       if isinstance(resolution, Mapping) and key in resolution]
+            choice = choices[0] if choices else None
+            resolved_at = episode.get("review_resolved_at")
+            selected = [int(row["id"]) for row in rows if row.get("selected")]
+            chosen = next(((row, score) for row, score in eligible
+                           if row["id"] == choice), None)
+            if (choices and all(type(value) is int and value > 0 and value == choice
+                                for value in choices)
+                    and type(resolved_at) in (int, float)
+                    and math.isfinite(resolved_at) and resolved_at > 0
+                    and selected == [choice] and chosen is not None):
+                return SelectionResult(
+                    candidate_id=choice,
+                    scores=tuple(scores),
+                    decision_reason="selected_review_resolution",
+                )
+            self.store.review_duplicate_candidates(
+                resolved_id,
+                {"candidate_ids": [int(row["id"]) for row in rows],
+                 "score": max((score.total for _, score in eligible), default=0.0),
+                 "reason": ReviewReason.DUPLICATE_EPISODE.value},
+            )
+            return SelectionResult(
+                review_reason=ReviewReason.DUPLICATE_EPISODE,
+                scores=tuple(scores),
+                decision_reason=ReviewReason.DUPLICATE_EPISODE.value,
+            )
         if not eligible:
             self.store.clear_candidate_selection(resolved_id)
             return SelectionResult(

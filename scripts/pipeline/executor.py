@@ -371,6 +371,14 @@ class PipelineRunner:
                 if summary["discovery"].get("error_count"):
                     summary["errors"] += int(summary["discovery"]["error_count"])
 
+                if (isinstance(window, Mapping) and window.get("auto_backfill")
+                        and any(getattr(error, "provider", "") == "moviepilot"
+                                for error in getattr(plan, "errors", ()))):
+                    # An unknown subscription/episode calendar must not fall
+                    # through to downloads that were queued on an older run.
+                    summary["stop_reason"] = "auto_backfill_calendar_unknown"
+                    return summary
+
             episodes = list(self.store.all_episodes())
             processed_ids: set[int] = set()
             for episode in episodes:
@@ -476,6 +484,12 @@ class PipelineRunner:
                     summary.add_handler(status)
                     latest = self.store.get_episode(int(row["id"])) or {}
                     summary.add_stage(_status_text(latest.get("status") or status))
+                    if (reason == "pre_submit_inventory_present"
+                            and isinstance(window, Mapping) and window.get("auto_backfill")):
+                        # Complete inventories proved presence. Keep this row
+                        # pending without claiming library acceptance, but do
+                        # not starve later confirmed-missing catch-up episodes.
+                        continue
                     if reason in {"pre_submit_inventory_present",
                                   "pre_submit_inventory_unknown",
                                   "pre_submit_inventory_error"}:

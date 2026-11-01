@@ -21,8 +21,8 @@ LABELS = frozenset({
     "preflight", "dry-run", "qualify", "plan-resources", "config", "runtime", "state.snapshot", "discovery",
     "litepan.tasks", "115.initialize", "115.capabilities", "115.source_root",
     "115.quarter_library_root", "115.request", "emby.library",
-    "moviepilot.subscriptions", "moviepilot.media_detail", "moviepilot.request",
-    "http.attempt", "source.feed", "qualification", "resources.inventory",
+    "moviepilot.subscriptions", "moviepilot.media_detail", "moviepilot.request", "moviepilot.season_episodes",
+    "http.attempt", "source.feed", "source.history", "qualification", "resources.inventory",
 })
 
 

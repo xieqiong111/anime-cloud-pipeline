@@ -191,6 +191,7 @@ class DiscoveryService:
         config: Any = None,
         secrets: Iterable[Any] = (),
         guard: Any = None,
+        subscription_snapshots: Iterable[Any] = (),
     ) -> None:
         self.store = store
         self.moviepilot = moviepilot
@@ -201,6 +202,9 @@ class DiscoveryService:
         # behaviour; when set it fails a full discovery closed before a
         # download (anime genre gate + legacy/TMDB identity dedup).
         self.guard = guard
+        self.subscription_snapshots = tuple(subscription_snapshots)
+        self._history_progress: dict[tuple, dict] = {}
+        self._history_sequence = 0
 
     def prepare(self, window: Any = None, read_only: bool = False) -> DiscoveryPlan:
         """Fetch, normalize, and optionally persist one discovery snapshot.
@@ -219,6 +223,8 @@ class DiscoveryService:
         decisions: list[CandidateDecision] = []
         errors: list[DiscoveryError] = []
         exclusions: list[DiscoveryExclusion] = []
+        backfill = {"aired_episodes": 0, "history_queries": 0,
+                    "source_unavailable": 0, "deferred_episodes": 0, "query_errors": 0}
 
         if not read_only and self.store is None:
             raise ValueError("store is required for write-mode discovery")
@@ -243,6 +249,10 @@ class DiscoveryService:
                 )
             )
             return self._plan(window, subscriptions, decisions, errors, exclusions)
+
+        self._load_history_progress(read_only)
+        if isinstance(window, Mapping) and window.get("auto_backfill"):
+            raw_subscriptions = sorted(raw_subscriptions, key=self._history_priority)
 
         if self.guard is not None:
             self._bind_guard()
@@ -315,6 +325,24 @@ class DiscoveryService:
                     exclusions.append(DiscoveryExclusion(identifier, "outside_current_quarter"))
                     continue
 
+            aired = None
+            if isinstance(window, Mapping) and window.get("auto_backfill"):
+                try:
+                    aired, unknown_dates = self._aired_episodes(subscription, window)
+                except Exception as exc:
+                    errors.append(DiscoveryError(
+                        identifier,
+                        self._safe_error(f"season episode inventory unavailable ({type(exc).__name__})"),
+                        provider="moviepilot", field="season_episodes",
+                    ))
+                    continue
+                backfill["aired_episodes"] += len(aired)
+                if unknown_dates:
+                    exclusions.append(DiscoveryExclusion(
+                        identifier, "episode_air_date_unknown",
+                        f"{unknown_dates} episodes excluded from automatic backfill",
+                    ))
+
             subscriptions.append(subscription)
             if not read_only:
                 self._persist_subscription(subscription, raw)
@@ -322,10 +350,9 @@ class DiscoveryService:
             for provider in self.providers:
                 provider_name = self._provider_name(provider)
                 try:
-                    with stage("source.feed"):
-                        source_results = self._provider_discover(provider, subscription, window)
-                    if source_results is None:
-                        source_results = []
+                    source_results = self._source_results(
+                        provider, subscription, window, aired, backfill, errors,
+                    )
                     for source_result in source_results:
                         if not source_result_in_window(subscription, source_result, window):
                             continue
@@ -343,6 +370,12 @@ class DiscoveryService:
                                     provider=_text(provider_name, self.secrets),
                                 )
                             )
+                            continue
+                        if aired is not None and not self._decision_is_aired(decision, aired):
+                            exclusions.append(DiscoveryExclusion(
+                                identifier, "episode_not_verified_aired",
+                                "candidate is outside the verified aired episode set",
+                            ))
                             continue
                         if self.guard is not None:
                             duplicate = self.guard.decision_exclusion(decision)
@@ -364,8 +397,182 @@ class DiscoveryService:
                             provider=_text(provider_name, self.secrets),
                         )
                     )
+            if not read_only and aired is not None:
+                self._persist_subscription(subscription, raw)
 
-        return self._plan(window, subscriptions, decisions, errors, exclusions)
+        return self._plan(window, subscriptions, decisions, errors, exclusions, backfill)
+
+    def _aired_episodes(self, subscription: Subscription, window: Mapping) -> tuple[set[int], int]:
+        """Unknown dates never prove an aired episode, and invalid calendars fail closed."""
+        if subscription.media_source.casefold() not in {"tmdb", "themoviedb"}:
+            raise ValueError("episode_calendar_identity_invalid")
+        today = dt.date.fromisoformat(str(window.get("as_of_date") or ""))
+        reader = getattr(self.moviepilot, "list_season_episodes", None)
+        if not callable(reader):
+            raise ValueError("episode_calendar_unavailable")
+        with stage("moviepilot.season_episodes"):
+            entries = reader(subscription.media_id, subscription.season)
+        cap = self.config.limits.max_recursive_files
+        if not isinstance(entries, list) or not entries or len(entries) > cap:
+            raise ValueError("episode_calendar_incomplete")
+        seen, aired, unknown = set(), set(), 0
+        for item in entries:
+            if not isinstance(item, Mapping):
+                raise ValueError("episode_calendar_invalid")
+            number = item.get("episode_number")
+            if (type(number) is not int or number <= 0 or number in seen
+                    or type(item.get("season_number")) is not int
+                    or item["season_number"] != subscription.season
+                    or ("show_id" in item and str(item["show_id"]) != subscription.media_id)):
+                raise ValueError("episode_calendar_identity_invalid")
+            seen.add(number)
+            date = item.get("air_date")
+            if date in (None, ""):
+                unknown += 1
+                continue
+            if not isinstance(date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+                raise ValueError("episode_calendar_date_invalid")
+            if dt.date.fromisoformat(date) <= today:
+                aired.add(number)
+        return aired, unknown
+
+    @staticmethod
+    def _decision_is_aired(decision: CandidateDecision, aired: set[int]) -> bool:
+        if decision.episode is None:
+            return False
+        end = decision.episode_end or decision.episode
+        return (end >= decision.episode and end - decision.episode < len(aired)
+                and all(number in aired for number in range(decision.episode, end + 1)))
+
+    def _source_results(self, provider, subscription, window, aired, backfill, errors):
+        """Supplement the normal feed with bounded, exact historical episode searches.
+
+        Source absence is only an unavailable candidate, never inventory proof.
+        Every yielded result still passes the common normalization and guard.
+        """
+        try:
+            with stage("source.feed"):
+                results = list(self._provider_discover(provider, subscription, window) or ())
+        except Exception as exc:
+            if aired is None:
+                raise
+            errors.append(DiscoveryError(
+                _text(subscription.subscription_id, self.secrets),
+                f"normal feed unavailable ({type(exc).__name__})",
+                provider=_text(self._provider_name(provider), self.secrets), field="feed",
+            ))
+            results = []
+        yield from results
+        if aired is None or not aired:
+            return
+        covered = set()
+        for result in results:
+            if not source_result_in_window(subscription, result, window):
+                continue
+            try:
+                decision = self._normalize_decision(subscription, result, self._provider_name(provider))
+            except Exception:
+                continue
+            if decision.decision == "candidate" and self._decision_is_aired(decision, aired):
+                # A collection currently creates only its starting episode row.
+                # Do not hide the remaining episodes from historical searches.
+                covered.add(decision.episode)
+        # Tracking is queue ownership, not evidence that a file exists. Existing
+        # rows resume via the unchanged runner rather than creating another job.
+        context = getattr(self.guard, "context", None)
+        for media_id, season, episode in getattr(context, "owned", {}):
+            if media_id == subscription.media_id and season == subscription.season:
+                covered.add(episode)
+        missing_sources = sorted(aired - covered)
+        if not missing_sources:
+            return
+        search = getattr(provider, "discover_episode", None)
+        if not callable(search):
+            raise ValueError("historical_episode_search_unavailable")
+        progress = self._history_progress.setdefault(
+            self._history_key(subscription), {"order": 0, "after_episode": {}},
+        )
+        provider_name = self._provider_name(provider)
+        after = progress["after_episode"].get(provider_name, 0)
+        ordered = [n for n in missing_sources if n > after] + [n for n in missing_sources if n <= after]
+        remaining = max(0, self.config.limits.max_reconcile_batch - backfill["history_queries"])
+        targets = ordered[:remaining]
+        backfill["deferred_episodes"] += len(ordered) - len(targets)
+        for number in targets:
+            scope = {**window, "backfill": {"media_id": subscription.media_id,
+                     "season": subscription.season, "start": number, "end": number},
+                     "require_explicit_season": subscription.season != 1}
+            backfill["history_queries"] += 1
+            progress["after_episode"][provider_name] = number
+            self._history_sequence += 1
+            progress["order"] = self._history_sequence
+            try:
+                with stage("source.history"):
+                    historical = list(search(subscription, number, scope) or ())
+            except Exception as exc:
+                backfill["query_errors"] += 1
+                errors.append(DiscoveryError(
+                    _text(subscription.subscription_id, self.secrets),
+                    f"historical episode {number} search failed ({type(exc).__name__})",
+                    provider=_text(provider_name, self.secrets), field="history_episode",
+                ))
+                continue
+            found = False
+            for result in historical:
+                if not source_result_in_window(subscription, result, scope):
+                    continue
+                try:
+                    decision = self._normalize_decision(subscription, result, provider_name)
+                except Exception as exc:
+                    errors.append(DiscoveryError(
+                        _text(subscription.subscription_id, self.secrets),
+                        f"historical source result rejected ({type(exc).__name__})",
+                        provider=_text(provider_name, self.secrets), field="history_episode",
+                    ))
+                    continue
+                if decision.decision == "candidate" and self._decision_is_aired(decision, aired):
+                    found = True
+                yield result
+            if not found:
+                backfill["source_unavailable"] += 1
+
+    def _history_key(self, subscription: Subscription) -> tuple:
+        return (
+            self._storage_identity("media_source", subscription.media_source),
+            self._storage_identity("media_id", subscription.media_id), subscription.season,
+            self._storage_identity("subscription_id", subscription.subscription_id),
+        )
+
+    def _load_history_progress(self, read_only: bool) -> None:
+        snapshots = self.subscription_snapshots
+        reader = getattr(self.store, "subscriptions", None) if not read_only else None
+        if callable(reader):
+            snapshots = tuple(reader())
+        self._history_progress = {}
+        self._history_sequence = 0
+        for row in snapshots:
+            try:
+                snapshot = json.loads(row["snapshot_json"])
+                if not isinstance(snapshot, Mapping):
+                    continue
+                progress = snapshot.get("_v5_history_search")
+                if (not isinstance(progress, dict) or type(progress.get("order")) is not int
+                        or progress["order"] < 0 or not isinstance(progress.get("after_episode"), dict)
+                        or any(not isinstance(k, str) or type(v) is not int or v < 0
+                               for k, v in progress["after_episode"].items())):
+                    continue
+                key = (row["media_source"], row["media_id"], row["season"], row["subscription_id"])
+                self._history_progress[key] = progress
+                self._history_sequence = max(self._history_sequence, progress["order"])
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    def _history_priority(self, raw: Any) -> int:
+        try:
+            key = self._history_key(normalize_subscription(raw))
+        except SubscriptionError:
+            return 0
+        return self._history_progress.get(key, {}).get("order", 0)
 
     def _bind_guard(self) -> None:
         """Recompute the guard's local ownership index from the state rows.
@@ -424,6 +631,7 @@ class DiscoveryService:
         decisions: list[CandidateDecision],
         errors: list[DiscoveryError],
         exclusions: list[DiscoveryExclusion],
+        backfill: Mapping[str, int] | None = None,
     ) -> DiscoveryPlan:
         summary = {
             "subscription_count": len(subscriptions),
@@ -435,6 +643,8 @@ class DiscoveryService:
                 (item.subscription_id, item.reason) for item in exclusions
             ),
         }
+        if isinstance(window, Mapping) and window.get("auto_backfill"):
+            summary["backfill"] = dict(backfill or {})
         return DiscoveryPlan(
             subscriptions=tuple(self._sanitize_subscription(sub) for sub in subscriptions),
             decisions=tuple(self._sanitize_decision(item) for item in decisions),
@@ -453,6 +663,11 @@ class DiscoveryService:
             # Keep the exact verified routing field visible even when the
             # upstream payload used a nested TMDB season envelope.
             snapshot["season_air_date"] = subscription.season_air_date
+            # Remote snapshots cannot supply or overwrite our local scan cursor.
+            snapshot.pop("_v5_history_search", None)
+            progress = self._history_progress.get(self._history_key(subscription))
+            if progress is not None:
+                snapshot["_v5_history_search"] = progress
         self.store.upsert_subscription(
             replace(self._sanitize_subscription(subscription), **{
                 field: self._storage_identity(field, getattr(subscription, field))
@@ -810,6 +1025,10 @@ def source_result_in_window(
     if not isinstance(window, Mapping):
         return True
     values = _window_source_values(source_result)
+    if window.get("auto_backfill") and subscription.season != 1:
+        declared_season = parse_season_episode(_plain_text(values.get("title") or values.get("name")))[0]
+        if values.get("season") in (None, "") and declared_season is None:
+            return False
 
     published_date = window.get("published_date")
     if published_date not in (None, ""):
@@ -863,6 +1082,8 @@ def source_result_in_window(
             resolved.append(parsed)
     season, episode, episode_end = resolved
     if season is None:
+        if window.get("require_explicit_season"):
+            return False
         season = subscription.season
     if episode_end is None:
         episode_end = episode

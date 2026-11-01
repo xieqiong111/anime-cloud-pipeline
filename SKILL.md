@@ -65,6 +65,26 @@ never create resources. Stop on incomplete inventories, unknown identity,
 conflicting resources, an unsupported creation interface, or a
 revision/quarter mismatch.
 
+## Automatic catch-up after subscribing
+
+On a normal authorized pipeline run, discover earlier aired episodes for each
+eligible current-quarter subscription as well as new releases. The shared
+`dry-run` previews the same discovery. Use the verified pipeline entrypoint;
+ordinary `run` enables automatic catch-up without a manually supplied range.
+Explicit `--previous-day`, `--backfill`, and `--resume-only` keep their bounded
+behavior. See [automatic catch-up](references/discovery.md) for calendar,
+source-search limits, unknown-date handling, and diagnostic counts.
+
+In DeepSeek Harness, use that installation's verified Skill directory and
+pipeline command. Invoke an independent V5 launcher with `V5_ANIME_GUARD=1`
+unless its verified config already enables the guard; do not rely on an
+Octop wrapper to supply this environment. A loaded Skill does not itself receive MoviePilot events;
+preserve the existing authorized trigger and single scheduler owner. Do not
+substitute an Octop workspace or create a second polling task. If no automatic
+trigger is configured, report that boundary before claiming subscription-time
+automation. Never equate a missing RSS result or a local queue row with a
+missing library episode; actual submission still requires complete inventories.
+
 ## Main flow and safety
 
 The normal `dry-run`, `run`, and `run --resume-only` scope is the current

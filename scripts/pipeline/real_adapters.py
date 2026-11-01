@@ -322,6 +322,16 @@ class KissSubSourceProvider:
             keyword = next((str(alias).strip() for alias in aliases if str(alias).strip()), "")
         if not keyword:
             return []
+        return self._discover_keyword(keyword, subscription, window)
+
+    def discover_episode(self, subscription: Any, episode: int, window: Any) -> list[SourceItem]:
+        """Search a historical episode; the shared gate verifies the exact identity."""
+        keyword = str(getattr(subscription, "work", "") or "").strip()
+        if not keyword or type(episode) is not int or episode <= 0:
+            raise ValueError("historical_episode_query_invalid")
+        return self._discover_keyword(f"{keyword} {episode:02d}", subscription, window)
+
+    def _discover_keyword(self, keyword: str, subscription: Any, window: Any) -> list[SourceItem]:
         feed_url = self.fetcher.feed_for_keyword(keyword)
         from .discovery import source_result_in_window
 
@@ -568,6 +578,36 @@ class MoviePilotClient(MoviePilotAdapter):
                 item["tmdb_genre_ids"] = genre_ids
             enriched.append(item)
         return enriched
+
+    def list_season_episodes(self, media_id: str, season: int) -> list[dict[str, Any]]:
+        """Read MoviePilot's unpaginated TMDB season endpoint without guessing gaps."""
+        if (not isinstance(media_id, str) or not media_id.isascii() or not media_id.isdigit()
+                or type(season) is not int or season <= 0):
+            raise ValueError("season_episode_identity_invalid")
+        endpoint = f"/api/v1/tmdb/{media_id}/{season}"
+        try:
+            with stage("moviepilot.season_episodes"):
+                status, payload = self._call("GET", endpoint)
+        except Exception as exc:
+            raise MoviePilotResponseError(
+                endpoint, f"request failed ({type(exc).__name__})"
+            ) from None
+        if status != 200:
+            raise MoviePilotResponseError(endpoint, "season episodes unavailable", status=status)
+        if isinstance(payload, dict):
+            if (set(payload) - {"data", "code", "message", "success", "total"}
+                    or ("success" in payload and not _moviepilot_success_flag(payload["success"]))
+                    or ("code" in payload and not _moviepilot_success_code(payload["code"]))):
+                raise MoviePilotResponseError(endpoint, "season episode envelope invalid")
+            entries = payload.get("data")
+            if "total" in payload and (type(payload["total"]) is not int
+                    or not isinstance(entries, list) or payload["total"] != len(entries)):
+                raise MoviePilotResponseError(endpoint, "season episode inventory incomplete")
+        else:
+            entries = payload
+        if not isinstance(entries, list) or not entries or not all(isinstance(v, dict) for v in entries):
+            raise MoviePilotResponseError(endpoint, "season episode inventory unavailable")
+        return entries
 
     def version(self) -> str:
         st, data = self._call("GET", "/api/v1/system/env")

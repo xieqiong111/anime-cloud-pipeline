@@ -77,7 +77,7 @@ class InventoryTests(unittest.TestCase):
             self.store.conn.execute('DELETE FROM download_files')
             self.store.conn.execute('DELETE FROM episodes_v5')
             self.own(other=other)
-            self.cloud.list_files.return_value = [{'file_id': 'fid', 'path': '/different/path'}]
+            self.cloud.list_files.return_value = [{'file_id': 'fid', 'path': '/cloud/organized/' + self.label + '/video.mkv'}]
             self.assertEqual(self.prove()['state'], 'missing' if other else 'present')
 
     def test_host_nonempty_unknown_even_nfo_and_never_reads_content(self):
@@ -86,11 +86,11 @@ class InventoryTests(unittest.TestCase):
         with mock.patch('builtins.open', side_effect=AssertionError('must not read contents')):
             self.assertEqual(self.prove()['state'], 'unknown')
 
-    def test_exact_selected_state_host_path_proves_present(self):
+    def test_noncanonical_strm_path_cannot_prove_presence(self):
         path = Path(self.config.paths.litepan_output_root) / self.label / 'episode.strm'
         path.write_text('private playback URL')
         self.own(host_path=str(path))
-        self.assertEqual(self.prove()['state'], 'present')
+        self.assertEqual(self.prove()['state'], 'unknown')
 
     def test_host_symlink_and_missing_root_unknown(self):
         root = Path(self.config.runtime.litepan_task_output_root)
@@ -152,6 +152,16 @@ class InventoryTests(unittest.TestCase):
         self.store.conn.execute('INSERT INTO episode_sources VALUES(2,1,1)')
         self.cloud.list_files.return_value = [{'file_id': 'fid'}]
         self.assertEqual(self.prove()['reason'], 'submission_inventory_ownership_unknown')
+
+    def test_multiple_primary_files_for_one_episode_are_unknown(self):
+        self.own()
+        self.store.conn.execute("INSERT INTO download_files VALUES(2,'other-fid','/cloud/organized/2026-10月新番/other.mkv')")
+        self.store.conn.execute('INSERT INTO episode_sources VALUES(1,2,1)')
+        self.assertEqual(self.prove()['state'], 'unknown')
+
+    def test_selected_mapping_without_remote_identity_is_unknown(self):
+        self.own(remote_id=None)
+        self.assertEqual(self.prove()['state'], 'unknown')
 
     def test_state_and_series_inventory_failures_never_become_missing(self):
         self.emby._series_provider_map.side_effect = ValueError('private provider token')

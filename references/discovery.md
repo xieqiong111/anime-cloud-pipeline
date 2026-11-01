@@ -34,11 +34,50 @@ timezone. The optional `--backfill` value must match
 `MEDIA_ID:SEASON:START-END` and must have `START <= END`; it is a bounded input,
 not a request to expand an entire season.
 
+## Automatic catch-up after subscribing
+
+Ordinary `run` and `dry-run` now read the verified subscription season's episode
+calendar through MoviePilot's unpaginated TMDB season endpoint. Only episodes
+with a known `air_date` on or before today in `schedule.timezone` enter automatic
+catch-up. Missing dates exclude those episodes; an unavailable, empty, malformed,
+or conflicting calendar stops discovery for that subscription and stops the
+automatic runner before it can submit previously queued episodes. The username,
+anime genre, season-premiere quarter, and identity gates run first.
+
+The normal keyword RSS is still used. For aired episodes it does not cover,
+KissSub is additionally searched using the work title and zero-padded episode
+number. Every result must pass the existing work, media identity, season, exact
+episode, exclusion, and guard checks. A broad search or a pack that extends
+beyond that exact historical episode cannot widen the request. A missing source
+is reported as unavailable and retried on a later scan; it never proves that a
+library episode is missing.
+
+Historical queries share one `limits.max_reconcile_batch` budget per invocation.
+The existing subscription snapshot stores a per-provider last-searched episode
+and a scan order; subsequent runs continue after that episode and prioritize
+subscriptions searched least recently. Read-only previews use the same saved
+cursor without advancing it. A release that cannot be found does not block
+searches for later episodes, regardless of scheduler frequency. Already tracked
+identities in the enabled guard resume through the existing queue. Run limits,
+task reconciliation, submission intent, and complete pre-submit inventories still
+control all actual downloads. Complete inventories proving presence skip that
+episode without blocking later catch-up work; unknown/error inventories stop
+the run. Presence alone never marks an episode as `library_ready`.
+`backfill` report counts describe source discovery, not confirmed missing files
+or completed downloads. `dry-run --details` includes safe error/exclusion reasons.
+
+Explicit `--previous-day`, explicit `--backfill`, and `--resume-only` retain their
+existing scopes. They do not enable automatic season expansion. Ordinary runs
+continue catch-up on later invocations, so a late release can be found without
+recreating the subscription. This does not install a scheduler or make a passive
+Skill receive subscription events; the host Harness must invoke the ordinary
+pipeline run through its existing authorized trigger.
+
 Validated limits bound network reads, task pages, recursive file depth/count,
 new submissions per run, and new submissions per subscription. `ConfigSchema`
-parses and preserves `max_review_batch` and `max_reconcile_batch`, but the
-current discovery execution does not wire those fields into batch loops; this
-reference makes no runtime batching claim. The discovery plan reports
+parses and preserves `max_review_batch`; it is not a discovery batch loop.
+`max_reconcile_batch` bounds historical source searches as described above.
+The discovery plan reports
 subscription, decision, error, and exclusion counts.
 
 ## Data and safety
