@@ -87,7 +87,7 @@ LEGACY_CONFIG = {
         {
             "media_id": "295071",
             "season": 1,
-            "kisssub_keyword": "示例动画",
+            "kisssub_keyword": "再见菈菈",
             "include": "简",
         }
     ],

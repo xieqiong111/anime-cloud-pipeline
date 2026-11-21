@@ -219,6 +219,8 @@ class DiscoveryService:
         ):
             raise ValueError("writable discovery requires a current-quarter window")
 
+        from .qualified_scope import allowed_identities, identity_allowed
+        qualified_identities = allowed_identities(window)
         subscriptions: list[Subscription] = []
         decisions: list[CandidateDecision] = []
         errors: list[DiscoveryError] = []
@@ -312,6 +314,12 @@ class DiscoveryService:
                         field=exc.field,
                     )
                 )
+                continue
+
+            if not identity_allowed({"media_source": subscription.media_source,
+                                     "media_id": subscription.media_id,
+                                     "season": subscription.season}, qualified_identities):
+                exclusions.append(DiscoveryExclusion(identifier, "outside_qualified_identity_scope"))
                 continue
 
             quarter = window.get("season_quarter") if isinstance(window, Mapping) else None

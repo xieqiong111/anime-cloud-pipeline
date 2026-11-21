@@ -14,6 +14,7 @@ from pathlib import Path
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
@@ -40,8 +41,8 @@ from pipeline.migrations import LATEST_SCHEMA_VERSION, MigrationRunner  # noqa: 
 from pipeline.paths import PathMapper  # noqa: E402
 from pipeline.security import sanitize_text  # noqa: E402
 from pipeline.services import ReviewService  # noqa: E402
-from pipeline.state import StateStore  # noqa: E402
-from pipeline.throttle import CloudThrottleState  # noqa: E402
+from pipeline.state import StateStore, ProcessLock  # noqa: E402
+from pipeline.throttle import CloudThrottleState, CloudCooldownStateError, throttle_decision  # noqa: E402
 
 
 class CliError(ValueError):
@@ -301,6 +302,7 @@ def build_runtime(
     path or copied into the validated configuration.
     """
 
+    from pipeline.adapters import RemoteInventoryIncomplete
     from pipeline.real_adapters import (
         EmbyClient,
         KissSubFetcher,
@@ -344,6 +346,8 @@ def build_runtime(
     if callable(resolve_source):
         try:
             resolve_source(config.paths.cloud_source_root)
+        except RemoteInventoryIncomplete:
+            raise
         except Exception:
             # Directory-chain proof is a pre-mutation gate.  Do not construct
             # a writable state graph when the source target is missing,
@@ -513,6 +517,7 @@ def _build_stage_services(
     store: Any = None,
     secrets: tuple[str, ...] = (),
     retry_random: Any = None,
+    throttle_state: Any = None,
 ) -> dict[str, Any]:
     """Create the concrete V5 service graph at one validated boundary."""
 
@@ -534,7 +539,7 @@ def _build_stage_services(
     # One account-level throttle state per run: every 115-reading stage shares
     # the cooldown, and the budget window rotates with the cron period so a
     # wide backlog cannot starve its tail.
-    throttle_state = CloudThrottleState()
+    throttle_state = throttle_state if throttle_state is not None else CloudThrottleState()
     rotation_seed = int(dt.datetime.now(dt.timezone.utc).timestamp()) // 600
     selector = CandidateSelector(store, scoring=config.scoring)
     target_directory = str(
@@ -577,6 +582,7 @@ def _build_stage_services(
             store,
             cloud,
             mapper,
+            config=config,
             secrets=secrets,
             throttle_state=throttle_state,
             jitter_seconds=getattr(retry, "jitter_seconds", 0.0) or 0.0,
@@ -793,6 +799,7 @@ def _summary_projection(summary: Mapping[str, Any]) -> dict[str, Any]:
         "skipped", "skipped_review", "skipped_terminal", "skipped_retry",
         "skipped_budget", "skipped_selection", "skipped_read_only",
         "skipped_state_changed", "skipped_pacing", "skipped_quarter", "skipped_scope", "errors",
+        "reconciliation_pending", "deferred_new_downloads",
     ):
         if key in summary:
             try:
@@ -803,11 +810,21 @@ def _summary_projection(summary: Mapping[str, Any]) -> dict[str, Any]:
         output["skipped_lock"] = bool(summary["skipped_lock"])
     if discovery_summary:
         output["discovery"] = discovery_summary
+    if isinstance(summary.get("cooldown_until"), (int, float)):
+        value = summary["cooldown_until"]
+        if not isinstance(value, bool) and math.isfinite(value):
+            output["cooldown_until"] = value
+    if summary.get("blocker_details"):
+        from pipeline.safe_diagnostics import safe_blocker_details
+        output["blocker_details"] = safe_blocker_details(summary["blocker_details"])
     if summary.get("stop_reason"):
         reason = summary["stop_reason"]
         output["stop_reason"] = reason if reason in {
             "pre_submit_inventory_present", "pre_submit_inventory_unknown",
-            "pre_submit_inventory_error",
+            "pre_submit_inventory_error", "cloud_cooldown_state_unreadable",
+            "cloud_cooldown_state_unwritable", "cloud_authentication_failed",
+            "cloud_read_unavailable", "cloud_read_rate_limited", "cloud_inventory_incomplete",
+            "download_reconciliation_state_unsupported", "download_submission_state_unavailable",
         } else "media_stage_blocked"
     return output
 
@@ -1461,14 +1478,289 @@ def cmd_prepare_resources(args: argparse.Namespace) -> int:
     return _cmd_resource_preparation(args, apply=True, command="prepare-resources")
 
 
+def _qualified_execution_scope(config: ConfigSchema, window: Mapping[str, Any]) -> dict[str, Any]:
+    from pipeline.qualified_scope import build_scope, QualifiedScopeError
+    from pipeline.resource_commands import qualify_current_subscriptions
+
+    with stage("qualification"):
+        report = qualify_current_subscriptions(config)
+    store = _open_readonly(config)
+    try:
+        episodes = store.all_episodes() if store is not None else []
+        try:
+            return build_scope(report, str(window["season_quarter"]), episodes)
+        except QualifiedScopeError as exc:
+            raise CliError(str(exc)) from None
+    finally:
+        _close_store(store)
+
+
+def cmd_scope_check(args: argparse.Namespace) -> int:
+    _raw, config = _config_mapping(args.config)
+    scope = _qualified_execution_scope(config, _window(args, config))
+    _json_output({"command": "scope-check", **scope})
+    return 0 if scope["status"] == "ok" else 2
+
+
+def cmd_cloud_names(args: argparse.Namespace) -> int:
+    """Preview, or explicitly prepare, bounded repairs of owned cloud names."""
+    from pipeline.cloud_naming import (
+        NamingPlanError, apply_name_plans, collect_name_plans, public_name_plan,
+    )
+    from pipeline.real_adapters import P115CloudAdapter
+    from pipeline.safe_diagnostics import safe_exception_diagnostics
+
+    _raw, config = _config_mapping(args.config)
+    window = _window(args, config)
+    if _quarter_resource_mismatches(config, window):
+        raise CliError("current-quarter naming resources are not configured")
+    scope = _qualified_execution_scope(config, window)
+    if scope["status"] != "ok":
+        _json_output({"command": "cloud-names", "status": "blocked",
+                      "reason": "qualified_scope_blocked", "scope": scope})
+        return 2
+    if args.id is not None and args.id <= 0:
+        raise CliError("--id must be a positive episode id")
+    run_lock = ProcessLock(os.path.join(os.path.dirname(_state_path(config)), "run.lock"))
+    locked, store = False, None
+    try:
+        if args.apply:
+            if not run_lock.acquire():
+                _json_output({"command": "cloud-names", "status": "blocked", "reason": "run_lock_active"})
+                return 2
+            locked = True
+        throttle = CloudThrottleState(os.path.join(os.path.dirname(_state_path(config)), "cloud-cooldown.json"))
+        if throttle.active(dt.datetime.now(dt.timezone.utc).timestamp()):
+            _json_output({"command": "cloud-names", "status": "blocked", "reason": "cloud_cooldown_active"})
+            return 2
+        root_path = _cloud_root_directory_path(config)
+        _validate_cloud_remote_roots(config, root_path)
+        cloud = P115CloudAdapter(None, root_directory_id=_cloud_root_directory_id(),
+                                root_directory_path=root_path,
+                                credential=_service_secret(config.services.cloud), runtime_config=config)
+        if not cloud.supports_isolated_rename():
+            raise NamingPlanError("isolated_rename_capability_missing")
+        store = _open_readonly(config)
+        if store is None:
+            raise NamingPlanError("naming_state_missing")
+        plans, blocked = collect_name_plans(store, cloud, PathMapper(config.paths), config, scope,
+                                          episode_id=args.id)
+        report = {"command": "cloud-names", "status": "plan_only", "scope": scope,
+                  "plan": public_name_plan(plans, blocked)}
+        if blocked:
+            # A writable planning read shares the same account cooldown as
+            # Organizer. Read-only preview must never persist throttle state.
+            if args.apply and any(item.get("category") in ("rate_limit", "transport") for item in blocked):
+                throttle_decision({"reason": "cloud_naming_plan_read_failed"}, state=throttle,
+                                  timestamp=dt.datetime.now(dt.timezone.utc).timestamp())
+                report["cooldown_until"] = throttle.throttled_until
+            report["status"] = "blocked"
+            _json_output(report)
+            return 2
+        if args.apply:
+            _close_store(store)
+            store = _open_writable(config)
+            applied = apply_name_plans(store, cloud, PathMapper(config.paths), config, plans,
+                                       secrets=_secret_values(config), throttle_state=throttle)
+            report["application"] = applied
+            report["status"] = "blocked" if any(not item["organized"] for item in applied["outcomes"]) else "ok"
+        _json_output(report)
+        return 2 if report["status"] == "blocked" else 0
+    except Exception as exc:
+        reason = exc.reason if isinstance(exc, NamingPlanError) else "naming_operation_unavailable"
+        diagnostic = safe_exception_diagnostics(exc, stage="organize_inventory")
+        if args.apply and locked and diagnostic.get("category") in ("rate_limit", "transport"):
+            try:
+                throttle_decision({"reason": "cloud_naming_read_failed"}, state=throttle,
+                                  timestamp=dt.datetime.now(dt.timezone.utc).timestamp())
+            except CloudCooldownStateError:
+                reason = "cloud_cooldown_state_unwritable"
+        _json_output({"command": "cloud-names", "status": "blocked", "reason": reason,
+                      "diagnostic": diagnostic})
+        return 2
+    finally:
+        _close_store(store)
+        if locked:
+            run_lock.release()
+
+
+def cmd_cloud_layout(args: argparse.Namespace) -> int:
+    """Preview or explicitly flatten qualified, already-owned cloud episodes."""
+    from pipeline.cloud_layout import (
+        LayoutPlanError, apply_layout_plans, collect_layout_plans, public_layout_plan,
+    )
+    from pipeline.real_adapters import P115CloudAdapter
+    from pipeline.safe_diagnostics import safe_exception_diagnostics
+
+    _raw, config = _config_mapping(args.config)
+    window = _window(args, config)
+    if _quarter_resource_mismatches(config, window):
+        raise CliError("current-quarter layout resources are not configured")
+    scope = _qualified_execution_scope(config, window)
+    if scope["status"] != "ok":
+        _json_output({"command": "cloud-layout", "status": "blocked",
+                      "scope": {"quarter": scope.get("quarter"), "status": scope.get("status")},
+                      "reason": "qualified_scope_blocked"})
+        return 2
+    if args.id is not None and args.id <= 0:
+        raise CliError("--id must be a positive episode id")
+
+    run_lock = ProcessLock(os.path.join(os.path.dirname(_state_path(config)), "run.lock"))
+    locked, store = False, None
+    throttle = None
+    try:
+        if args.apply:
+            if not run_lock.acquire():
+                _json_output({"command": "cloud-layout", "status": "blocked",
+                              "reason": "run_lock_active"})
+                return 2
+            locked = True
+        throttle = CloudThrottleState(os.path.join(os.path.dirname(_state_path(config)),
+                                                  "cloud-cooldown.json"))
+        if throttle.active(dt.datetime.now(dt.timezone.utc).timestamp()):
+            _json_output({"command": "cloud-layout", "status": "blocked",
+                          "reason": "cloud_cooldown_active"})
+            return 2
+        root_path = _cloud_root_directory_path(config)
+        _validate_cloud_remote_roots(config, root_path)
+        cloud = P115CloudAdapter(None, root_directory_id=_cloud_root_directory_id(),
+                                root_directory_path=root_path,
+                                credential=_service_secret(config.services.cloud), runtime_config=config)
+        if (not cloud.supports_isolated_rename()
+                or not callable(getattr(cloud, "supports_isolated_move", None))
+                or not cloud.supports_isolated_move()
+                or not callable(getattr(cloud, "supports_flat_season_move", None))
+                or not cloud.supports_flat_season_move()):
+            raise LayoutPlanError("isolated_layout_capability_missing")
+        store = _open_readonly(config)
+        if store is None:
+            raise LayoutPlanError("layout_state_missing")
+        mapper = PathMapper(config.paths)
+        plans, blocked = collect_layout_plans(store, cloud, mapper, config, scope,
+                                               episode_id=args.id)
+        report = {
+            "command": "cloud-layout",
+            "status": "plan_only",
+            "scope": {"quarter": scope.get("quarter"), "status": scope.get("status")},
+            "plan": public_layout_plan(plans, blocked),
+        }
+        if blocked:
+            if args.apply and any(item.get("category") in ("rate_limit", "transport")
+                                  for item in blocked):
+                throttle_decision({"reason": "cloud_layout_plan_read_failed"}, state=throttle,
+                                  timestamp=dt.datetime.now(dt.timezone.utc).timestamp())
+                report["reason"] = "cloud_layout_inventory_unavailable"
+            report["status"] = "blocked"
+            _json_output(report)
+            return 2
+        if args.apply:
+            _close_store(store)
+            store = _open_writable(config)
+            application = apply_layout_plans(
+                store, cloud, mapper, config, plans,
+                secrets=_secret_values(config), throttle_state=throttle,
+            )
+            report["application"] = application
+            report["status"] = (
+                "blocked" if any(not item["organized"] for item in application["outcomes"])
+                else "ok"
+            )
+        _json_output(report)
+        return 2 if report["status"] == "blocked" else 0
+    except Exception as exc:
+        reason = exc.reason if isinstance(exc, LayoutPlanError) else "layout_operation_unavailable"
+        diagnostic = safe_exception_diagnostics(exc, stage="organize_inventory")
+        if args.apply and locked and diagnostic.get("category") in ("rate_limit", "transport"):
+            try:
+                throttle_decision({"reason": "cloud_layout_read_failed"}, state=throttle,
+                                  timestamp=dt.datetime.now(dt.timezone.utc).timestamp())
+            except CloudCooldownStateError:
+                reason = "cloud_cooldown_state_unwritable"
+        _json_output({"command": "cloud-layout", "status": "blocked", "reason": reason})
+        return 2
+    finally:
+        _close_store(store)
+        if locked:
+            run_lock.release()
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     _raw, config = _config_mapping(args.config)
     window = _window(args, config)
     mismatches = _quarter_resource_mismatches(config, window)
     if mismatches:
         raise CliError("current-quarter resources are not configured: " + ", ".join(mismatches))
+    scope = _qualified_execution_scope(config, window)
+    if scope["status"] != "ok":
+        _json_output({"command": "run", "status": "blocked",
+                      "stop_reason": "qualified_scope_blocked", "scope": scope})
+        return 2
+    if not scope["runnable"]:
+        _json_output({"command": "run", "status": "ok",
+                      "no_runnable_subscriptions": True, "scope": scope})
+        return 0
+    window = dict(window)
+    window["qualified_scope"] = scope
+    os.makedirs(os.path.dirname(_state_path(config)), exist_ok=True)
+    run_lock = ProcessLock(os.path.join(os.path.dirname(_state_path(config)), "run.lock"))
+    if not run_lock.acquire():
+        _json_output({"command": "run", "status": "ok", "skipped_lock": True})
+        return 0
+    try:
+        code = _execute_run_locked(args, _raw, config, window, scope)
+    finally:
+        run_lock.release()
+    stills = _backfill_episode_stills_after_run(config)
+    if stills.get("filled"):
+        print(json.dumps({"episode_stills_backfill": stills}, ensure_ascii=False),
+              file=sys.stderr)
+    return code
+
+
+def _backfill_episode_stills_after_run(config: ConfigSchema) -> dict:
+    """Best-effort still-image backfill; never changes the run result."""
+    try:
+        from pipeline.episode_stills import backfill_episode_stills
+    except Exception:
+        return {}
+    store = None
+    try:
+        store = _open_writable(config)
+        return backfill_episode_stills(store, config.paths.state_directory)
+    except Exception:
+        return {}
+    finally:
+        _close_store(store)
+
+
+def _execute_run_locked(args, raw_config, config, window, scope):
+    from pipeline.adapters import RemoteRateLimited, RemoteInventoryIncomplete
+    from pipeline.safe_diagnostics import safe_exception_diagnostics
+    cooldown_path = os.path.join(os.path.dirname(_state_path(config)), "cloud-cooldown.json")
+    try:
+        throttle = CloudThrottleState(cooldown_path)
+    except CloudCooldownStateError as exc:
+        _json_output({"command": "run", "status": "blocked", "stop_reason": str(exc), "scope": scope})
+        return 2
+    if throttle.active(dt.datetime.now(dt.timezone.utc).timestamp()):
+        _json_output({"command": "run", "status": "blocked", "stop_reason": "cloud_cooldown_active",
+                      "cooldown_until": throttle.throttled_until, "scope": scope})
+        return 2
     _json_output_guard: Any = None
-    runtime = build_runtime(config, writable=True)
+    try:
+        runtime = build_runtime(config, writable=True)
+    except RemoteInventoryIncomplete as exc:
+        if isinstance(exc, RemoteRateLimited):
+            try:
+                throttle_decision({"reason": "cloud_startup_read_failed"}, state=throttle,
+                                  timestamp=dt.datetime.now(dt.timezone.utc).timestamp())
+            except CloudCooldownStateError as state_exc:
+                _json_output({"command": "run", "status": "blocked", "stop_reason": str(state_exc), "scope": scope})
+                return 2
+        _json_output({"command": "run", "status": "blocked", "stop_reason": "cloud_startup_read_failed",
+                      "blocker_details": safe_exception_diagnostics(exc, stage="startup"),
+                      "cooldown_until": throttle.throttled_until, "scope": scope})
+        return 2
     _validate_stage_services(runtime.services)
     store = _open_writable(config)
     try:
@@ -1483,6 +1775,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 providers=runtime.providers,
                 store=store,
                 secrets=_secret_values(config),
+                throttle_state=throttle,
             )
         _validate_stage_services(runtime.services)
         runtime.candidate_selector = runtime.services["candidate_selector"]
@@ -1495,7 +1788,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                 config=config,
                 secrets=_secret_values(config),
             )
-        guard = build_discovery_guard(_raw)
+        guard = build_discovery_guard(raw_config)
         if guard is not None:
             discovery.guard = guard
             _json_output_guard = guard.describe()
@@ -1506,7 +1799,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             discovery=discovery,
             services=runtime.services,
             config=config,
-            lock_path=os.path.join(os.path.dirname(_state_path(config)), "run.lock"),
+            lock=None,
             secrets=_secret_values(config),
         )
         summary = runner.run(discover=not args.resume_only, read_only=False, window=window)
@@ -1518,6 +1811,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         "command": "run",
         "status": "blocked" if blocked else "ok",
         "guard": _json_output_guard,
+        "scope": scope,
         **projection,
     })
     if blocked:
@@ -1532,15 +1826,28 @@ def cmd_status(args: argparse.Namespace) -> int:
         _json_output({"command": "status", "status": "empty", "episodes": []})
         return 0
     try:
+        secrets = _secret_values(config)
         episodes = []
         for row in store.all_episodes():
             episodes.append({
                 "id": int(row.get("id") or 0),
                 "status": str(row.get("status") or ""),
+                "media_source": sanitize_text(
+                    row.get("media_source") or "", secrets=secrets,
+                ),
+                "media_id": sanitize_text(
+                    row.get("media_id") or "", secrets=secrets,
+                ),
                 "season": row.get("season"),
                 "episode": row.get("episode"),
                 "hash_prefix": _safe_prefix(row.get("infohash")),
                 "submit_count": int(row.get("submit_count") or 0),
+                "retry_count": int(row.get("retry_count") or 0),
+                "next_retry_at": (
+                    row.get("next_retry_at")
+                    if type(row.get("next_retry_at")) in (int, float)
+                    and math.isfinite(row["next_retry_at"]) else None
+                ),
             })
     finally:
         _close_store(store)
@@ -1565,13 +1872,17 @@ def cmd_reviews_list(args: argparse.Namespace) -> int:
         _json_output({"command": "reviews list", "status": "empty", "reviews": []})
         return 0
     try:
-        rows = ReviewService(store).list_open()
+        rows = ReviewService(store, secrets=_secret_values(config)).list_open()
         reviews = [
             {
                 "review_id": int(row.get("review_id") or 0),
                 "review_reason": str(row.get("review_reason") or ""),
                 "review_generation": int(row.get("review_generation") or 0),
                 "status": "open",
+                "media_source": row.get("media_source"),
+                "media_id": row.get("media_id"),
+                "season": row.get("season"),
+                "episode": row.get("episode"),
             }
             for row in rows
         ]
@@ -1686,6 +1997,10 @@ def _parser() -> argparse.ArgumentParser:
     dry.add_argument("--details", action="store_true")
     dry.set_defaults(handler=cmd_dry_run)
 
+    scoped = sub.add_parser("scope-check", help="read-only qualified identity and review scope")
+    scoped.add_argument("--config", required=True)
+    scoped.set_defaults(handler=cmd_scope_check)
+
     qualify = sub.add_parser("qualify", help="read-only subscription qualification")
     qualify.add_argument("--config", required=True)
     qualify.set_defaults(handler=cmd_qualify)
@@ -1702,6 +2017,20 @@ def _parser() -> argparse.ArgumentParser:
     prepare_resources.add_argument("--config", required=True)
     prepare_resources.add_argument("--apply", action="store_true", required=True)
     prepare_resources.set_defaults(handler=cmd_prepare_resources)
+
+    cloud_names = sub.add_parser("cloud-names", help="preview or repair canonical names of already-owned episodes")
+    cloud_names.add_argument("--config", required=True)
+    cloud_names.add_argument("--apply", action="store_true")
+    cloud_names.add_argument("--id", type=int)
+    cloud_names.set_defaults(handler=cmd_cloud_names)
+
+    cloud_layout = sub.add_parser(
+        "cloud-layout", help="preview or flatten qualified owned videos into Season directories"
+    )
+    cloud_layout.add_argument("--config", required=True)
+    cloud_layout.add_argument("--apply", action="store_true")
+    cloud_layout.add_argument("--id", type=int)
+    cloud_layout.set_defaults(handler=cmd_cloud_layout)
 
     run = sub.add_parser("run", help="one bounded V5 runner invocation")
     add_run_options(run)
@@ -1735,7 +2064,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     try:
         args = _parser().parse_args(list(argv) if argv is not None else None)
-        if args.command in {"preflight", "dry-run", "qualify", "plan-resources"}:
+        if (args.command in {"preflight", "dry-run", "qualify", "scope-check", "plan-resources"}
+                or args.command == "cloud-names" and not args.apply
+                or args.command == "cloud-layout" and not args.apply):
             with read_only_command(args.command):
                 return int(args.handler(args))
         return int(args.handler(args))

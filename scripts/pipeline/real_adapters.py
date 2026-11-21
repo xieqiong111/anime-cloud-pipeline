@@ -22,6 +22,7 @@ import posixpath
 import re
 import threading
 import time
+import socket
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -29,13 +30,15 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from .adapters import (Cloud115Adapter, EmbyAdapter, LitePanAdapter,
                        EmbyInventoryError, MoviePilotAdapter, OfflineTask,
-                       RemoteDirectoryMissing, RemoteInventoryIncomplete, RemotePathConflict,
-                       RemoteRateLimited, ScrapeResult,
+                       RemoteAuthenticationError, RemoteDirectoryMissing,
+                       RemoteInventoryIncomplete, RemotePathConflict,
+                       RemoteRateLimited, RemoteServiceUnavailable, ScrapeResult,
                        _library_location_values,
                        _validate_emby_item_contract, find_episode_match)
 from .diagnostics import request_timeout, stage
 from .http import HttpError, JsonHttpClient, RetryPolicy
 from .parsers import FeedFormatError, SourceItem, normalize_infohash, parse_feed
+from .paths import PathMappingError, _remote_file_id_token, _safe_basename
 from .security import sanitize_text
 from .services import _as_task_list
 
@@ -913,7 +916,13 @@ class EmbyClient(EmbyAdapter):
     def refresh_library(self, library_id: str) -> Any:
         st, _ = self._request(
             "POST", f"/emby/Items/{_safe_emby_segment(library_id)}/Refresh",
-            params={"Recursive": "true"},
+            params={
+                "Recursive": "true",
+                "MetadataRefreshMode": "FullRefresh",
+                "ImageRefreshMode": "Default",
+                "ReplaceAllMetadata": "false",
+                "ReplaceAllImages": "false",
+            },
         )
         if st not in (200, 204):
             raise RuntimeError(f"refresh HTTP {st}")
@@ -1398,6 +1407,32 @@ class P115CloudAdapter(Cloud115Adapter):
 
         return True
 
+    def supports_flat_season_move(self) -> bool:
+        """Whether the SDK exposes the primitives for verified flat moves.
+
+        This is a cooperative single-writer capability. The installed move
+        endpoint has no proven no-replace or compare-and-set contract.
+        """
+
+        return (
+            callable(getattr(self._client, "fs_move", None))
+            and any(callable(getattr(self._client, name, None))
+                    for name in ("fs_files", "fs_files_aps"))
+        )
+
+    def supports_isolated_rename(self) -> bool:
+        """Whether the SDK has the ordinary rename call for the isolated flow.
+
+        This capability is deliberately separate from ``supports_atomic_rename``:
+        ``fs_rename`` is not exposed as a shared no-replace primitive.
+        """
+
+        return (
+            callable(getattr(self._client, "fs_rename", None))
+            and any(callable(getattr(self._client, name, None))
+                    for name in ("fs_files", "fs_files_aps"))
+        )
+
     @staticmethod
     def _infohash_from(uri_or_hash: str) -> str:
         text = urllib.parse.unquote(str(uri_or_hash or "").strip())
@@ -1560,14 +1595,17 @@ class P115CloudAdapter(Cloud115Adapter):
         if fn is None:
             raise RemoteInventoryIncomplete(
                 "115 task-list API is unavailable",
-                kind="tasks",
+                kind="tasks", stage="task_page",
             )
         try:
             result = fn({"page": page, "page_size": self.page_size, "limit": self.page_size})
         except RemoteInventoryIncomplete:
             raise
         except Exception as exc:
-            raise RemoteRateLimited("115 task-list API call failed", kind="tasks") from exc
+            raise _classify_remote_exception(
+                exc, kind="tasks", stage="task_page",
+                message="115 task-list API call failed",
+            ) from None
         info = _decode_remote_response(result, kind="tasks")
         _raise_on_failed_envelope(info, kind="tasks")
         tasks, total, complete = _task_items_and_total(
@@ -1585,20 +1623,34 @@ class P115CloudAdapter(Cloud115Adapter):
         for page in range(1, cap + 1):
             tasks, total, page_size, complete = self._task_page(page)
             if any(not isinstance(task, dict) for task in tasks):
-                raise RemoteInventoryIncomplete("115 task inventory contains invalid item", kind="tasks")
+                raise RemoteInventoryIncomplete(
+                    "115 task inventory contains invalid item",
+                    kind="tasks", stage="task_page",
+                )
             if total is not None:
                 if expected_total is not None and total != expected_total:
-                    raise RemoteInventoryIncomplete("115 task inventory total changed", kind="tasks")
+                    raise RemoteInventoryIncomplete(
+                        "115 task inventory total changed",
+                        kind="tasks", stage="task_page",
+                    )
                 expected_total = total
             projected_seen = seen + len(tasks)
-            _raise_on_contradictory_total(expected_total, projected_seen, kind="tasks")
+            _raise_on_contradictory_total(
+                expected_total, projected_seen, kind="tasks", stage="task_page"
+            )
             # True means explicit end, False means explicit continuation,
             # and None allows the ordinary short-page completion contract.
             if complete is False and (not tasks or expected_total == projected_seen):
-                raise RemoteInventoryIncomplete("115 task inventory continuation is contradictory", kind="tasks")
+                raise RemoteInventoryIncomplete(
+                    "115 task inventory continuation is contradictory",
+                    kind="tasks", stage="task_page",
+                )
             terminal = complete is True or (complete is None and len(tasks) < page_size)
             if terminal and expected_total is not None and projected_seen < expected_total:
-                raise RemoteInventoryIncomplete("115 task inventory ended before total", kind="tasks")
+                raise RemoteInventoryIncomplete(
+                    "115 task inventory ended before total",
+                    kind="tasks", stage="task_page",
+                )
             for task in tasks:
                 yield task
             seen = projected_seen
@@ -1607,7 +1659,7 @@ class P115CloudAdapter(Cloud115Adapter):
             if page == cap:
                 raise RemoteInventoryIncomplete(
                     "remote task inventory reached its safety cap",
-                    kind="tasks",
+                    kind="tasks", stage="task_page",
                 )
 
     def _task_list_raw(self) -> list:
@@ -1678,30 +1730,51 @@ class P115CloudAdapter(Cloud115Adapter):
             )
         else:
             profiles = ((profile, getattr(self._client, profile, None)),)
-        failures: list[str] = []
+        failures: list[RemoteInventoryIncomplete] = []
+        auth_failure: Optional[RemoteAuthenticationError] = None
+        transport_only = True
         # 缺失画像只是客户端能力不全，不属于失败证据：先筛出实际可调用的
-        # 画像，缺失者不参与失败分类。单画像配置下唯一画像超时也因此仍按
-        # 全传输级失败聚合为限流退避，而不是被误降级为清单矛盾。
+        # 画像，缺失者不参与失败分类。
         available = [(name, fn) for name, fn in profiles if callable(fn)]
         if not available:
             raise RemoteInventoryIncomplete(
-                "115 listing capability unavailable", kind="files"
+                "115 listing capability unavailable",
+                kind="files", stage="listing_request",
             )
-        transport_only = True
-        transport_failure: BaseException | None = None
         for name, fn in available:
             try:
                 info = _decode_remote_response(fn(dict(body)), kind="files")
+            except RemoteServiceUnavailable as exc:
+                failures.append(exc)
+                continue
             except RemoteRateLimited:
                 # 决定性的限流信封：直接向上抛，不当作画像矛盾被聚合吞掉。
                 raise
+            except RemoteAuthenticationError as exc:
+                failures.append(exc)
+                auth_failure = auth_failure or exc
+                transport_only = False
+                continue
             except RemoteInventoryIncomplete as exc:
-                failures.append(f"{name}: {exc}")
+                failures.append(exc)
                 transport_only = False
                 continue
             except Exception as exc:
-                failures.append(f"{name}: {type(exc).__name__} {exc}")
-                transport_failure = transport_failure or exc
+                classified = _classify_remote_exception(
+                    exc, kind="files", stage="listing_request",
+                    message="115 file-list API call failed",
+                )
+                if (
+                    isinstance(classified, RemoteRateLimited)
+                    and not isinstance(classified, RemoteServiceUnavailable)
+                ):
+                    raise classified from None
+                failures.append(classified)
+                if isinstance(classified, RemoteAuthenticationError):
+                    auth_failure = auth_failure or classified
+                    transport_only = False
+                elif not isinstance(classified, RemoteServiceUnavailable):
+                    transport_only = False
                 continue
             # aps 信封会回显请求的 cid；回显不一致说明该画像服务的是另一个
             # 目录的清单，必须按错误信封 fail-closed。web 信封无此字段，
@@ -1710,19 +1783,29 @@ class P115CloudAdapter(Cloud115Adapter):
             if envelope_cid not in (None, "") and str(envelope_cid) != body["cid"]:
                 raise RemoteInventoryIncomplete(
                     "115 file-list envelope echoes a different directory cid",
-                    kind="files",
+                    kind="files", stage="listing_request",
                 )
             return info
-        if transport_only and transport_failure is not None:
-            # 全部失败都是传输级（HTTP 错误/超时/断连），没有任何清单矛盾：
-            # 这是限流或服务不可用信号，调用方应退避重试而非消耗审查预算。
-            raise RemoteRateLimited(
-                "115 file-list API call failed (" + "; ".join(failures) + ")",
-                kind="files",
-            ) from transport_failure
+        if auth_failure is not None:
+            raise RemoteAuthenticationError(
+                "115 file-list authentication failed",
+                kind="files", stage="listing_request",
+                http_status=auth_failure.http_status,
+                remote_code=auth_failure.remote_code,
+            ) from None
+        if transport_only and failures:
+            # 所有可用画像都只有明确可退避的传输/服务失败；缺少清单或
+            # schema 不明不参与该分类。
+            first = failures[0]
+            raise RemoteServiceUnavailable(
+                "115 file-list service unavailable",
+                kind="files", stage="listing_request",
+                http_status=first.http_status,
+                remote_code=first.remote_code,
+            ) from None
         raise RemoteInventoryIncomplete(
-            "115 file-list API call failed (" + "; ".join(failures) + ")",
-            kind="files",
+            "115 file-list inventory could not be proven complete",
+            kind="files", stage="listing_request",
         )
 
     def fs_files(self, directory_id: Any, *, require_complete: bool = False) -> list:
@@ -1745,8 +1828,12 @@ class P115CloudAdapter(Cloud115Adapter):
                 keys=("data", "list", "items", "files", "rows"),
                 kind="files",
             )
-        failures: list[str] = []
-        all_rate_limited = True
+        retryable_only = True
+        saw_rate_limit = False
+        saw_service_unavailable = False
+        rate_failure: Optional[RemoteRateLimited] = None
+        service_failure: Optional[RemoteServiceUnavailable] = None
+        auth_failure: Optional[RemoteAuthenticationError] = None
         # 与 _listing_request 相同：缺失画像不参与失败分类，只遍历实际可
         # 调用的画像；能力缺失按清单不可证明 fail-closed。
         callable_profiles = tuple(
@@ -1756,7 +1843,8 @@ class P115CloudAdapter(Cloud115Adapter):
         )
         if not callable_profiles:
             raise RemoteInventoryIncomplete(
-                "115 listing capability unavailable", kind="directories"
+                "115 listing capability unavailable",
+                kind="directories", stage="listing_request",
             )
         for profile in callable_profiles:
             def request(payload: Any) -> Mapping[str, Any]:
@@ -1769,25 +1857,50 @@ class P115CloudAdapter(Cloud115Adapter):
                     request, directory_token, first, self.page_size, self.max_task_pages
                 )
                 _raise_on_missing_or_duplicate_listing_identities(entries)
-            except RemoteRateLimited as exc:
-                failures.append(f"{profile}: {exc}")
+            except RemoteServiceUnavailable as exc:
+                saw_service_unavailable = True
+                service_failure = service_failure or exc
                 continue
-            except RemoteInventoryIncomplete as exc:
-                failures.append(f"{profile}: {exc}")
-                all_rate_limited = False
+            except RemoteRateLimited as exc:
+                saw_rate_limit = True
+                rate_failure = rate_failure or exc
+                continue
+            except RemoteAuthenticationError as exc:
+                auth_failure = auth_failure or exc
+                retryable_only = False
+                continue
+            except RemoteInventoryIncomplete:
+                retryable_only = False
                 continue
             return entries
-        if all_rate_limited:
-            # 两个画像都只在传输层失败：限流/不可用信号，与清单矛盾分开。
-            raise RemoteRateLimited(
-                "115 complete directory listing failed on every client profile ("
-                + "; ".join(failures) + ")",
-                kind="directories",
-            )
+        if auth_failure is not None:
+            raise RemoteAuthenticationError(
+                "115 complete directory listing authentication failed",
+                kind="directories", stage="directory_page",
+                http_status=auth_failure.http_status,
+                remote_code=auth_failure.remote_code,
+            ) from None
+        if retryable_only:
+            # 所有可用画像都只有明确限流或可退避传输失败。
+            # RemoteServiceUnavailable 保持为 RemoteRateLimited 子类，供旧
+            # 调用方继续走冷却；具体类别由 attrs 区分。
+            if saw_rate_limit:
+                raise RemoteRateLimited(
+                    "115 complete directory listing was rate limited",
+                    kind="directories", stage="directory_page",
+                    http_status=rate_failure.http_status if rate_failure else None,
+                    remote_code=rate_failure.remote_code if rate_failure else None,
+                ) from None
+            if saw_service_unavailable:
+                raise RemoteServiceUnavailable(
+                    "115 complete directory listing service unavailable",
+                    kind="directories", stage="directory_page",
+                    http_status=service_failure.http_status if service_failure else None,
+                    remote_code=service_failure.remote_code if service_failure else None,
+                ) from None
         raise RemoteInventoryIncomplete(
-            "115 complete directory listing failed on every client profile ("
-            + "; ".join(failures) + ")",
-            kind="directories",
+            "115 complete directory listing could not be proven complete",
+            kind="directories", stage="directory_page",
         )
 
     def get_file(self, path: str) -> Optional[Dict[str, Any]]:
@@ -1900,6 +2013,1300 @@ class P115CloudAdapter(Cloud115Adapter):
         """Read a complete directory inventory by its durable remote identity."""
 
         return self.fs_files(_remote_directory_id(directory_id), require_complete=True)
+
+    @staticmethod
+    def _flat_size(value: Any) -> int:
+        if isinstance(value, bool):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season file size is invalid", kind="files",
+                stage="flat_season_inventory",
+            )
+        if isinstance(value, int):
+            size = value
+        elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+            size = int(value)
+        else:
+            size = 0
+        if size <= 0:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season file size is missing or invalid", kind="files",
+                stage="flat_season_inventory",
+            )
+        return size
+
+    def _flat_path_parts(self, path: Any, *, kind: str) -> tuple[str, tuple[str, ...]]:
+        normalized = _normalize_remote_path(path, kind=kind)
+        parts = _remote_path_parts(normalized)
+        root = self._root_path_parts
+        if not root or tuple(parts[:len(root)]) != root:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season path is outside the configured root", kind=kind,
+                stage="flat_season_path",
+            )
+        return normalized, parts
+
+    def _flat_owners(self, owners: Any) -> dict[str, dict[str, Any]]:
+        """Validate the trusted store manifest without inferring ownership."""
+
+        if isinstance(owners, (str, bytes, Mapping)):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season ownership manifest is missing", kind="files",
+                stage="flat_season_ownership",
+            )
+        try:
+            owner_rows = list(owners)
+        except TypeError:
+            owner_rows = []
+        if not owner_rows:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season ownership manifest is missing", kind="files",
+                stage="flat_season_ownership",
+            )
+        by_id: dict[str, dict[str, Any]] = {}
+        canonical_paths: set[str] = set()
+        staging_ids: set[str] = set()
+        for owner in owner_rows:
+            if not isinstance(owner, Mapping):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season ownership manifest is incomplete", kind="files",
+                    stage="flat_season_ownership",
+                )
+            raw_id = owner.get("file_id")
+            if raw_id is None or isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season owner file identity is missing", kind="files",
+                    stage="flat_season_ownership",
+                )
+            file_id = str(raw_id)
+            if not file_id or file_id != file_id.strip():
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season owner file identity is invalid", kind="files",
+                    stage="flat_season_ownership",
+                )
+            size = self._flat_size(owner.get("size"))
+            fingerprint = owner.get("fingerprint")
+            if not isinstance(fingerprint, str) or not fingerprint.strip():
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season owner fingerprint is missing", kind="files",
+                    stage="flat_season_ownership",
+                )
+            canonical_path, canonical_parts = self._flat_path_parts(
+                owner.get("canonical_path"), kind="files"
+            )
+            name = _safe_basename(canonical_parts[-1], "canonical_path")
+            if (
+                len(canonical_parts) < len(self._root_path_parts) + 4
+                or re.fullmatch(r"Season [0-9]+", canonical_parts[-2]) is None
+                or posixpath.splitext(name)[1].casefold() not in VIDEO_EXT
+            ):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season owner path is not a canonical season video",
+                    kind="files", stage="flat_season_ownership",
+                )
+            raw_staging_id = owner.get("staging_directory_id")
+            staging_id = (
+                str(_remote_directory_id(raw_staging_id))
+                if raw_staging_id not in (None, "") else None
+            )
+            if (
+                file_id in by_id
+                or canonical_path in canonical_paths
+                or (staging_id is not None and staging_id in staging_ids)
+            ):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season ownership manifest has duplicate identities",
+                    kind="files", stage="flat_season_ownership",
+                )
+            try:
+                token = _remote_file_id_token(raw_id)
+            except (PathMappingError, TypeError, ValueError):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season owner file identity is invalid", kind="files",
+                    stage="flat_season_ownership",
+                ) from None
+            record = {
+                "file_id": file_id,
+                "size": size,
+                "fingerprint": fingerprint,
+                "canonical_path": canonical_path,
+                "name": name,
+                "season_path": posixpath.dirname(canonical_path),
+                "quarter": canonical_parts[len(self._root_path_parts)],
+                "staging_directory_id": staging_id,
+                "staging_name": token,
+            }
+            by_id[file_id] = record
+            canonical_paths.add(canonical_path)
+            if staging_id is not None:
+                staging_ids.add(staging_id)
+        return by_id
+
+    @staticmethod
+    def _flat_explicit_parent(
+        item: Mapping[str, Any], directory_id: Any, *, is_directory: bool
+    ) -> None:
+        keys = (
+            ("pid", "parent_id", "parent_directory_id")
+            if is_directory
+            else ("cid", "pid", "parent_id", "parent_directory_id")
+        )
+        observed = _first_value(item, keys)
+        if observed not in (None, "") and str(observed) != str(directory_id):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season entry has a different parent identity",
+                kind="files", stage="flat_season_inventory",
+            )
+
+    def _flat_explicit_path(
+        self, item: Mapping[str, Any], expected_path: str
+    ) -> None:
+        observed = _first_value(item, ("path", "full_path", "remote_path"))
+        if observed in (None, ""):
+            return
+        if _normalize_remote_path(observed, kind="files") != expected_path:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season entry path does not match its parent listing",
+                kind="files", stage="flat_season_inventory",
+            )
+
+    def _flat_season_inventory(
+        self,
+        directory_id: Any,
+        directory_path: str,
+        owners: Mapping[str, Mapping[str, Any]],
+    ) -> dict[str, Any]:
+        """Prove every direct Season entry belongs to this season's manifest."""
+
+        directory_token = str(_remote_directory_id(directory_id))
+        normalized_path, parts = self._flat_path_parts(directory_path, kind="directories")
+        if not parts or re.fullmatch(r"Season [0-9]+", parts[-1]) is None:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season inventory target is not a Season directory",
+                kind="directories", stage="flat_season_inventory",
+            )
+        entries = self.list_directory_entries(directory_token)
+        if not isinstance(entries, list):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season inventory is incomplete", kind="files",
+                stage="flat_season_inventory",
+            )
+        names: set[str] = set()
+        item_ids: set[str] = set()
+        by_name: dict[str, dict[str, Any]] = {}
+        raw_by_name: dict[str, Mapping[str, Any]] = {}
+        directories: dict[str, dict[str, Any]] = {}
+        files: dict[str, dict[str, Any]] = {}
+        snapshot: list[tuple[Any, ...]] = []
+        season_owners = {
+            file_id: owner for file_id, owner in owners.items()
+            if owner["season_path"] == normalized_path
+        }
+        owners_by_staging = {
+            owner["staging_directory_id"]: owner
+            for owner in season_owners.values()
+            if owner["staging_directory_id"] is not None
+        }
+        for item in entries:
+            if not isinstance(item, Mapping):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season inventory contains an unknown entry",
+                    kind="files", stage="flat_season_inventory",
+                )
+            name = _item_name(item)
+            try:
+                name = _safe_basename(name, "season_entry")
+            except (PathMappingError, TypeError, ValueError):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season inventory contains an invalid name",
+                    kind="files", stage="flat_season_inventory",
+                ) from None
+            if name in names:
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season inventory contains duplicate names",
+                    kind="files", stage="flat_season_inventory",
+                )
+            names.add(name)
+            full_path = posixpath.join(normalized_path, name)
+            is_directory = _item_is_directory(item)
+            self._flat_explicit_parent(item, directory_token, is_directory=is_directory)
+            self._flat_explicit_path(item, full_path)
+            if is_directory:
+                raw_directory_id = _strict_directory_id(item)
+                if raw_directory_id in (None, ""):
+                    raise RemoteInventoryIncomplete(
+                        "115 flat-season directory identity is missing",
+                        kind="directories", stage="flat_season_inventory",
+                    )
+                item_id = str(raw_directory_id)
+                owner = owners_by_staging.get(item_id)
+                if owner is None or name != owner["staging_name"]:
+                    raise RemoteInventoryIncomplete(
+                        "115 flat-season inventory contains an unowned directory",
+                        kind="directories", stage="flat_season_inventory",
+                    )
+                if item_id in item_ids:
+                    raise RemoteInventoryIncomplete(
+                        "115 flat-season inventory contains a duplicate directory ID",
+                        kind="directories", stage="flat_season_inventory",
+                    )
+                item_ids.add(item_id)
+                record = {"kind": "directory", "id": item_id, "name": name,
+                          "path": full_path, "parent_id": directory_token}
+                directories[item_id] = record
+                by_name[name] = record
+                raw_by_name[name] = item
+                snapshot.append(("directory", item_id, name, directory_token))
+                continue
+
+            raw_file_id = _strict_file_id(item)
+            if raw_file_id in (None, "") or isinstance(raw_file_id, bool):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season file identity is missing", kind="files",
+                    stage="flat_season_inventory",
+                )
+            file_id = str(raw_file_id)
+            owner = season_owners.get(file_id)
+            if owner is None:
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season inventory contains an unowned file",
+                    kind="files", stage="flat_season_inventory",
+                )
+            size = self._flat_size(_first_value(item, ("size", "s")))
+            fingerprint = _first_value(
+                item, ("fingerprint", "content_fingerprint", "sha1", "sha", "etag")
+            )
+            if not isinstance(fingerprint, str) or not fingerprint.strip():
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season file fingerprint is missing", kind="files",
+                    stage="flat_season_inventory",
+                )
+            if (
+                name != owner["name"]
+                or full_path != owner["canonical_path"]
+                or size != owner["size"]
+                or fingerprint.casefold() != owner["fingerprint"].casefold()
+            ):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season file does not match its owner record",
+                    kind="files", stage="flat_season_inventory",
+                )
+            if file_id in item_ids:
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season inventory contains a duplicate file ID",
+                    kind="files", stage="flat_season_inventory",
+                )
+            item_ids.add(file_id)
+            record = {"kind": "file", "id": file_id, "name": name,
+                      "path": full_path, "parent_id": directory_token,
+                      "size": size, "fingerprint": fingerprint}
+            files[file_id] = record
+            by_name[name] = record
+            raw_by_name[name] = item
+            snapshot.append(("file", file_id, name, size,
+                             fingerprint.casefold(), directory_token))
+        return {
+            "path": normalized_path,
+            "directory_id": directory_token,
+            "entries": entries,
+            "by_name": by_name,
+            "raw_by_name": raw_by_name,
+            "directories": directories,
+            "files": files,
+            "snapshot": tuple(sorted(snapshot)),
+        }
+
+    def _flat_file_entry(
+        self,
+        item: Any,
+        *,
+        identity: Mapping[str, Any],
+        path: str,
+        parent_id: Any,
+        owner: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if not isinstance(item, Mapping) or _item_is_directory(item):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season source is not one file", kind="files",
+                stage="flat_season_source",
+            )
+        file_id = _strict_file_id(item)
+        if file_id in (None, "") or isinstance(file_id, bool):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season source file identity is missing", kind="files",
+                stage="flat_season_source",
+            )
+        name = _item_name(item)
+        size = self._flat_size(_first_value(item, ("size", "s")))
+        fingerprint = _first_value(
+            item, ("fingerprint", "content_fingerprint", "sha1", "sha", "etag")
+        )
+        if (
+            str(file_id) != str(identity["remote_file_id"])
+            or name != owner["name"]
+            or posixpath.basename(path) != owner["name"]
+            or size != owner["size"]
+            or not isinstance(fingerprint, str)
+            or fingerprint.casefold() != owner["fingerprint"].casefold()
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season source file does not match its owner record",
+                kind="files", stage="flat_season_source",
+            )
+        self._flat_explicit_parent(item, parent_id, is_directory=False)
+        self._flat_explicit_path(item, posixpath.join(posixpath.dirname(path), name))
+        result = dict(item)
+        result.update({
+            "remote_file_id": str(file_id), "file_id": str(file_id),
+            "name": name, "filename": name, "path": path,
+            "parent_path": posixpath.dirname(path),
+            "parent_id": str(parent_id), "size": size,
+            "fingerprint": fingerprint,
+        })
+        return result
+
+    @staticmethod
+    def _flat_owner_identity(identity: Any, owners: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+        if not isinstance(identity, Mapping):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season selected identity is missing", kind="files",
+                stage="flat_season_identity",
+            )
+        raw_id = identity.get("remote_file_id") or identity.get("file_id")
+        if raw_id is None or isinstance(raw_id, bool) or not isinstance(raw_id, (int, str)):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season selected file identity is missing", kind="files",
+                stage="flat_season_identity",
+            )
+        file_id = str(raw_id)
+        owner = owners.get(file_id)
+        if owner is None:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season selected file has no owner record", kind="files",
+                stage="flat_season_identity",
+            )
+        size = P115CloudAdapter._flat_size(identity.get("size"))
+        fingerprint = identity.get("fingerprint") or identity.get("etag")
+        if (
+            size != owner["size"]
+            or not isinstance(fingerprint, str)
+            or fingerprint.casefold() != owner["fingerprint"].casefold()
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season selected identity differs from its owner record",
+                kind="files", stage="flat_season_identity",
+            )
+        return {"remote_file_id": file_id, "size": size,
+                "fingerprint": fingerprint, "owner": owner}
+
+    def _flat_move_request(self, item_id: Any, target_directory_id: Any, *, kind: str) -> None:
+        """Issue exactly one installed SDK move call; never infer a CAS contract."""
+
+        fn = getattr(self._client, "fs_move", None)
+        if not callable(fn):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season move API is unavailable", kind=kind,
+                stage="flat_season_move",
+            )
+        try:
+            response = fn(str(item_id), pid=_p115_id(target_directory_id))
+        except Exception as exc:
+            raise _classify_remote_exception(
+                exc, kind=kind, stage="flat_season_move",
+                message="115 flat-season move outcome is unknown",
+            ) from None
+        info = _decode_remote_response(response, kind=kind)
+        if not isinstance(info, Mapping):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season move response has an unknown outcome", kind=kind,
+                stage="flat_season_move",
+            )
+        if _remote_conflict_marker(info):
+            raise RemotePathConflict("115 flat-season move target conflict")
+        _raise_on_failed_envelope(info, kind=kind)
+        if not _explicit_remote_success(info):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season move response does not confirm success", kind=kind,
+                stage="flat_season_move",
+            )
+
+    def move_staged_file_to_season(
+        self,
+        identity: Mapping[str, Any],
+        source_path: str,
+        target_path: str,
+        *,
+        source_directory_id: Any,
+        target_directory_id: Any,
+        owners: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Move one staged video directly into its Season directory.
+
+        The ownership manifest and complete before/after inventories support a
+        single-writer protocol. The installed ``fs_move`` endpoint is not
+        treated as server-side no-replace or compare-and-set. The caller must
+        hold the shared pipeline run lock and ensure this Season has no other
+        writers. An uncertain request is never retried here; a later invocation
+        may accept only a fully verified already-applied target as read-only.
+        """
+
+        if not self.supports_flat_season_move():
+            raise RemoteInventoryIncomplete(
+                "115 flat-season move capabilities are unavailable", kind="files",
+                stage="flat_season_capability",
+            )
+        owner_records = self._flat_owners(owners)
+        selected = self._flat_owner_identity(identity, owner_records)
+        owner = selected["owner"]
+        file_id = selected["remote_file_id"]
+        source, source_parts = self._flat_path_parts(source_path, kind="files")
+        target, target_parts = self._flat_path_parts(target_path, kind="files")
+        staging_id = str(_remote_directory_id(source_directory_id))
+        season_id = str(_remote_directory_id(target_directory_id))
+        season_path = posixpath.dirname(target)
+        source_parent = posixpath.dirname(source)
+        if (
+            len(source_parts) < len(self._root_path_parts) + 5
+            or re.fullmatch(r"Season [0-9]+", source_parts[-3]) is None
+            or source_parts[-2] != owner["staging_name"]
+            or source_parts[-1] != owner["name"]
+            or target_parts != source_parts[:-2] + (source_parts[-1],)
+            or source_parent != posixpath.join(season_path, owner["staging_name"])
+            or owner["canonical_path"] != target
+            or owner["season_path"] != season_path
+            or owner["staging_directory_id"] != staging_id
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season source and target paths do not match the owner",
+                kind="files", stage="flat_season_path",
+            )
+        if str(self.resolve_directory_path(season_path)) != season_id:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season target directory identity changed",
+                kind="directories", stage="flat_season_path",
+            )
+
+        before = self._flat_season_inventory(season_id, season_path, owner_records)
+        target_entry = before["by_name"].get(owner["name"])
+        staging_entry = before["directories"].get(staging_id)
+        source_entries = self.list_directory_entries(staging_id)
+        if not isinstance(source_entries, list):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season source inventory is incomplete", kind="files",
+                stage="flat_season_source",
+            )
+        if target_entry is not None:
+            if (
+                target_entry.get("kind") != "file"
+                or target_entry.get("id") != file_id
+                or target_entry.get("size") != selected["size"]
+                or target_entry.get("fingerprint", "").casefold()
+                != selected["fingerprint"].casefold()
+                or not isinstance(source_entries, list)
+                or source_entries
+            ):
+                raise RemoteInventoryIncomplete(
+                    "115 flat-season target name is occupied or source is not empty",
+                    kind="files", stage="flat_season_reconcile",
+                )
+            if staging_entry is not None:
+                if staging_entry.get("id") != staging_id:
+                    raise RemoteInventoryIncomplete(
+                        "115 flat-season staging directory identity changed",
+                        kind="directories", stage="flat_season_reconcile",
+                    )
+                if str(self.resolve_directory_path(source_parent)) != staging_id:
+                    raise RemoteInventoryIncomplete(
+                        "115 flat-season staging path identity changed",
+                        kind="directories", stage="flat_season_reconcile",
+                    )
+            else:
+                try:
+                    self.resolve_directory_path(source_parent)
+                except RemoteDirectoryMissing:
+                    pass
+                else:
+                    raise RemoteInventoryIncomplete(
+                        "115 flat-season staging path resolves to an unexpected directory",
+                        kind="directories", stage="flat_season_reconcile",
+                    )
+                archive_root = posixpath.join(
+                    self.root_directory_path, owner["quarter"], ".pipeline-staging"
+                )
+                archived_path = posixpath.join(archive_root, owner["staging_name"])
+                if str(self.resolve_directory_path(archived_path)) != staging_id:
+                    raise RemoteInventoryIncomplete(
+                        "115 flat-season archived staging identity changed",
+                        kind="directories", stage="flat_season_reconcile",
+                    )
+            record = self._flat_file_entry(
+                before["raw_by_name"][owner["name"]],
+                identity=selected, path=target, parent_id=season_id, owner=owner,
+            )
+            record.update({
+                "already_applied": True, "atomic": False,
+                "_mutation_performed": False,
+            })
+            return record
+
+        if staging_entry is None or staging_entry.get("id") != staging_id:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season staging directory is not in its Season", kind="directories",
+                stage="flat_season_source",
+            )
+        if str(self.resolve_directory_path(source_parent)) != staging_id:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season staging path identity changed", kind="directories",
+                stage="flat_season_source",
+            )
+        if len(source_entries) != 1:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season source directory is not a singleton", kind="files",
+                stage="flat_season_source",
+            )
+        self._flat_file_entry(
+            source_entries[0], identity=selected, path=source,
+            parent_id=staging_id, owner=owner,
+        )
+
+        immediate = self._flat_season_inventory(season_id, season_path, owner_records)
+        if immediate["snapshot"] != before["snapshot"]:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season target inventory changed before move", kind="files",
+                stage="flat_season_prewrite",
+            )
+        if owner["name"] in immediate["by_name"]:
+            raise RemotePathConflict("115 flat-season target name appeared before move")
+        if str(self.resolve_directory_path(season_path)) != season_id:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season target directory identity changed before move",
+                kind="directories", stage="flat_season_prewrite",
+            )
+        if str(self.resolve_directory_path(source_parent)) != staging_id:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season staging directory identity changed before move",
+                kind="directories", stage="flat_season_prewrite",
+            )
+        source_entries = self.list_directory_entries(staging_id)
+        if not isinstance(source_entries, list) or len(source_entries) != 1:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season source changed before move", kind="files",
+                stage="flat_season_prewrite",
+            )
+        self._flat_file_entry(
+            source_entries[0], identity=selected, path=source,
+            parent_id=staging_id, owner=owner,
+        )
+
+        self._flat_move_request(file_id, season_id, kind="files")
+
+        after = self._flat_season_inventory(season_id, season_path, owner_records)
+        moved_entry = after["by_name"].get(owner["name"])
+        expected_snapshot = tuple(sorted((*before["snapshot"], (
+            "file", file_id, owner["name"], selected["size"],
+            selected["fingerprint"].casefold(), season_id,
+        ))))
+        if (
+            after["snapshot"] != expected_snapshot
+            or moved_entry is None
+            or moved_entry.get("kind") != "file"
+            or moved_entry.get("id") != file_id
+            or moved_entry.get("path") != target
+            or moved_entry.get("parent_id") != season_id
+            or moved_entry.get("size") != selected["size"]
+            or moved_entry.get("fingerprint", "").casefold()
+            != selected["fingerprint"].casefold()
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 flat-season post-move inventory does not match the expected change",
+                kind="files", stage="flat_season_postwrite",
+            )
+        source_after = self.list_directory_entries(staging_id)
+        if not isinstance(source_after, list) or source_after:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season staging directory is not empty after move",
+                kind="files", stage="flat_season_postwrite",
+            )
+        if str(self.resolve_directory_path(season_path)) != season_id:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season target directory identity changed after move",
+                kind="directories", stage="flat_season_postwrite",
+            )
+        if str(self.resolve_directory_path(source_parent)) != staging_id:
+            raise RemoteInventoryIncomplete(
+                "115 flat-season staging directory identity changed after move",
+                kind="directories", stage="flat_season_postwrite",
+            )
+        result = self._flat_file_entry(
+            after["raw_by_name"][owner["name"]], identity=selected,
+            path=target, parent_id=season_id, owner=owner,
+        )
+        result.update({
+            "already_applied": False, "atomic": False,
+            "_mutation_performed": True,
+        })
+        return result
+
+    def archive_empty_staging_directory(
+        self,
+        source_directory_id: Any,
+        source_parent_path: str,
+        archive_root_path: str,
+        *,
+        archive_directory_id: Any,
+        file_id: Any,
+        owners: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Move a verified empty owned fid directory into quarter staging.
+
+        This preserves the directory ID and never deletes it. The move remains
+        non-atomic; the caller must hold the shared run lock and ensure a single
+        writer. ``owners`` must account for every fid/direct video in the
+        Season and every directory already present in the archive root.
+        """
+
+        if not self.supports_flat_season_move():
+            raise RemoteInventoryIncomplete(
+                "115 staging archive move capabilities are unavailable",
+                kind="directories", stage="flat_season_capability",
+            )
+        owner_records = self._flat_owners(owners)
+        selected = owner_records.get(str(file_id))
+        if selected is None:
+            raise RemoteInventoryIncomplete(
+                "115 staging directory has no owner record", kind="directories",
+                stage="staging_archive_identity",
+            )
+        normalized_parent, season_parts = self._flat_path_parts(
+            source_parent_path, kind="directories"
+        )
+        archive_path, archive_parts = self._flat_path_parts(
+            archive_root_path, kind="directories"
+        )
+        source_id = str(_remote_directory_id(source_directory_id))
+        archive_id = str(_remote_directory_id(archive_directory_id))
+        if (
+            not season_parts
+            or re.fullmatch(r"Season [0-9]+", season_parts[-1]) is None
+            or selected["season_path"] != normalized_parent
+            or selected["staging_directory_id"] != source_id
+            or len(archive_parts) != len(self._root_path_parts) + 2
+            or archive_parts[len(self._root_path_parts)] != selected["quarter"]
+            or archive_parts[-1] != ".pipeline-staging"
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 staging archive paths do not match the owner", kind="directories",
+                stage="staging_archive_path",
+            )
+        season_id = str(self.resolve_directory_path(normalized_parent))
+        if str(self.resolve_directory_path(archive_path)) != archive_id:
+            raise RemoteInventoryIncomplete(
+                "115 staging archive directory identity changed", kind="directories",
+                stage="staging_archive_path",
+            )
+        token = selected["staging_name"]
+        source_path = posixpath.join(normalized_parent, token)
+        archive_target = posixpath.join(archive_path, token)
+
+        def archive_inventory() -> dict[str, Any]:
+            entries = self.list_directory_entries(archive_id)
+            if not isinstance(entries, list):
+                raise RemoteInventoryIncomplete(
+                    "115 staging archive inventory is incomplete", kind="directories",
+                    stage="staging_archive_inventory",
+                )
+            names: set[str] = set()
+            ids: set[str] = set()
+            rows: list[tuple[Any, ...]] = []
+            by_name: dict[str, dict[str, Any]] = {}
+            archive_owners = {
+                owner["staging_directory_id"]: owner
+                for owner in owner_records.values()
+                if (owner["quarter"] == selected["quarter"]
+                    and owner["staging_directory_id"] is not None)
+            }
+            for item in entries:
+                if not isinstance(item, Mapping) or not _item_is_directory(item):
+                    raise RemoteInventoryIncomplete(
+                        "115 staging archive contains an unknown entry",
+                        kind="directories", stage="staging_archive_inventory",
+                    )
+                name = _item_name(item)
+                try:
+                    name = _safe_basename(name, "staging_directory")
+                except (PathMappingError, TypeError, ValueError):
+                    raise RemoteInventoryIncomplete(
+                        "115 staging archive contains an invalid directory name",
+                        kind="directories", stage="staging_archive_inventory",
+                    ) from None
+                directory_id = _strict_directory_id(item)
+                if directory_id in (None, ""):
+                    raise RemoteInventoryIncomplete(
+                        "115 staging archive directory identity is missing",
+                        kind="directories", stage="staging_archive_inventory",
+                    )
+                directory_token = str(directory_id)
+                owner = archive_owners.get(directory_token)
+                if (
+                    name in names or directory_token in ids or owner is None
+                    or name != owner["staging_name"]
+                ):
+                    raise RemoteInventoryIncomplete(
+                        "115 staging archive contains an unknown or duplicate directory",
+                        kind="directories", stage="staging_archive_inventory",
+                    )
+                self._flat_explicit_parent(item, archive_id, is_directory=True)
+                self._flat_explicit_path(
+                    item, posixpath.join(archive_path, name)
+                )
+                names.add(name)
+                ids.add(directory_token)
+                record = {"id": directory_token, "name": name,
+                          "path": posixpath.join(archive_path, name)}
+                by_name[name] = record
+                rows.append(("directory", directory_token, name, archive_id))
+            return {"entries": entries, "by_name": by_name,
+                    "snapshot": tuple(sorted(rows))}
+
+        season_before = self._flat_season_inventory(
+            season_id, normalized_parent, owner_records
+        )
+        owned_video = season_before["files"].get(selected["file_id"])
+        if owned_video is None:
+            raise RemoteInventoryIncomplete(
+                "115 staging archive owner video is not directly in its Season",
+                kind="files", stage="staging_archive_source",
+            )
+        staging_entry = season_before["directories"].get(source_id)
+        source_entries = self.list_directory_entries(source_id)
+        archive_before = archive_inventory()
+        archived_entry = archive_before["by_name"].get(token)
+        if archived_entry is not None:
+            if (
+                archived_entry["id"] != source_id
+                or staging_entry is not None
+                or not isinstance(source_entries, list)
+                or source_entries
+            ):
+                raise RemoteInventoryIncomplete(
+                    "115 staging archive target conflicts with its owner",
+                    kind="directories", stage="staging_archive_reconcile",
+                )
+            if str(self.resolve_directory_path(archive_target)) != source_id:
+                raise RemoteInventoryIncomplete(
+                    "115 archived staging directory identity changed",
+                    kind="directories", stage="staging_archive_reconcile",
+                )
+            return {"directory_id": source_id, "path": archive_target,
+                    "already_applied": True, "atomic": False,
+                    "_mutation_performed": False}
+
+        if (
+            staging_entry is None
+            or staging_entry.get("id") != source_id
+            or not isinstance(source_entries, list)
+            or source_entries
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 staging archive source is not the owned empty directory",
+                kind="directories", stage="staging_archive_source",
+            )
+        if str(self.resolve_directory_path(source_path)) != source_id:
+            raise RemoteInventoryIncomplete(
+                "115 staging archive source directory identity changed",
+                kind="directories", stage="staging_archive_source",
+            )
+        season_immediate = self._flat_season_inventory(
+            season_id, normalized_parent, owner_records
+        )
+        archive_immediate = archive_inventory()
+        source_immediate = self.list_directory_entries(source_id)
+        if (
+            season_immediate["snapshot"] != season_before["snapshot"]
+            or archive_immediate["snapshot"] != archive_before["snapshot"]
+            or token in archive_immediate["by_name"]
+            or not isinstance(source_immediate, list)
+            or source_immediate
+            or str(self.resolve_directory_path(normalized_parent)) != season_id
+            or str(self.resolve_directory_path(source_path)) != source_id
+            or str(self.resolve_directory_path(archive_path)) != archive_id
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 staging archive inventories changed before move",
+                kind="directories", stage="staging_archive_prewrite",
+            )
+        if str(self.resolve_directory_path(archive_path)) != archive_id:
+            raise RemoteInventoryIncomplete(
+                "115 staging archive directory identity changed before move",
+                kind="directories", stage="staging_archive_prewrite",
+            )
+
+        self._flat_move_request(source_id, archive_id, kind="directories")
+
+        season_after = self._flat_season_inventory(
+            season_id, normalized_parent, owner_records
+        )
+        archive_after = archive_inventory()
+        expected_season = tuple(sorted(
+            row for row in season_before["snapshot"]
+            if not (row[0] == "directory" and row[1] == source_id)
+        ))
+        expected_archive = tuple(sorted((*archive_before["snapshot"], (
+            "directory", source_id, token, archive_id,
+        ))))
+        source_after = self.list_directory_entries(source_id)
+        if (
+            season_after["snapshot"] != expected_season
+            or archive_after["snapshot"] != expected_archive
+            or archive_after["by_name"].get(token, {}).get("id") != source_id
+            or not isinstance(source_after, list)
+            or source_after
+            or str(self.resolve_directory_path(archive_target)) != source_id
+            or str(self.resolve_directory_path(archive_path)) != archive_id
+            or str(self.resolve_directory_path(normalized_parent)) != season_id
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 staging archive post-move inventory does not match the expected change",
+                kind="directories", stage="staging_archive_postwrite",
+            )
+        return {"directory_id": source_id, "path": archive_target,
+                "already_applied": False, "atomic": False,
+                "_mutation_performed": True}
+
+    def delete_empty_staging_directory(
+        self,
+        source_directory_id: Any,
+        source_parent_path: str,
+        *,
+        file_id: Any,
+        owners: Iterable[Mapping[str, Any]],
+    ) -> Dict[str, Any]:
+        """Delete a verified empty owned fid directory after its video is flat.
+
+        This replaces the archive move: the emptied per-file directory is
+        removed in place through the SDK delete endpoint (115 keeps it in the
+        recycle bin) and the caller records ``staging_archive_state`` as
+        ``deleted``. The operation is idempotent: a directory that is already
+        gone reports ``already_applied`` without a second mutation.
+        """
+
+        if not self.supports_flat_season_move():
+            raise RemoteInventoryIncomplete(
+                "115 staging delete capabilities are unavailable",
+                kind="directories", stage="flat_season_capability",
+            )
+        owner_records = self._flat_owners(owners)
+        selected = owner_records.get(str(file_id))
+        if selected is None:
+            raise RemoteInventoryIncomplete(
+                "115 staging directory has no owner record", kind="directories",
+                stage="staging_delete_identity",
+            )
+        normalized_parent, season_parts = self._flat_path_parts(
+            source_parent_path, kind="directories"
+        )
+        source_id = str(_remote_directory_id(source_directory_id))
+        if (
+            not season_parts
+            or re.fullmatch(r"Season [0-9]+", season_parts[-1]) is None
+            or selected["season_path"] != normalized_parent
+            or selected["staging_directory_id"] != source_id
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 staging delete paths do not match the owner",
+                kind="directories", stage="staging_delete_path",
+            )
+        season_id = str(self.resolve_directory_path(normalized_parent))
+        season_before = self._flat_season_inventory(
+            season_id, normalized_parent, owner_records
+        )
+        if season_before["files"].get(selected["file_id"]) is None:
+            raise RemoteInventoryIncomplete(
+                "115 staging delete owner video is not directly in its Season",
+                kind="files", stage="staging_delete_source",
+            )
+        staging_entry = season_before["directories"].get(source_id)
+        try:
+            source_entries = self.list_directory_entries(source_id)
+        except Exception:
+            source_entries = None
+        if staging_entry is None and source_entries is None:
+            return {"directory_id": source_id, "deleted": True,
+                    "already_applied": True, "atomic": False,
+                    "_mutation_performed": False}
+        if (
+            staging_entry is None
+            or staging_entry.get("id") != source_id
+            or not isinstance(source_entries, list)
+            or source_entries
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 staging delete source is not the owned empty directory",
+                kind="directories", stage="staging_delete_source",
+            )
+        self._flat_delete_request(source_id, kind="directories")
+        season_after = self._flat_season_inventory(
+            season_id, normalized_parent, owner_records
+        )
+        try:
+            source_after = self.list_directory_entries(source_id)
+        except Exception:
+            source_after = None
+        expected_season = tuple(sorted(
+            row for row in season_before["snapshot"]
+            if not (row[0] == "directory" and row[1] == source_id)
+        ))
+        if (
+            season_after["snapshot"] != expected_season
+            or source_id in season_after["directories"]
+            or source_after is not None
+            or str(self.resolve_directory_path(normalized_parent)) != season_id
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 staging delete post-write inventory does not match the expected change",
+                kind="directories", stage="staging_delete_postwrite",
+            )
+        return {"directory_id": source_id, "deleted": True,
+                "already_applied": False, "atomic": False,
+                "_mutation_performed": True}
+
+    def delete_empty_source_directory(self, source_parent_path: str) -> Dict[str, Any]:
+        """Delete the emptied download directory under the quarter 未整理 root.
+
+        The download task wraps one file in a directory of the same name; after
+        the isolated move that directory stays empty. Only this exact shape
+        (``<root>/<quarter>/未整理/<name>``) is ever touched, and only after a
+        complete listing proves it empty. Idempotent: a missing directory
+        reports ``already_applied`` without a second mutation.
+        """
+
+        if not self.supports_flat_season_move():
+            raise RemoteInventoryIncomplete(
+                "115 download source delete capabilities are unavailable",
+                kind="directories", stage="flat_season_capability",
+            )
+        normalized, parts = self._flat_path_parts(source_parent_path, kind="directories")
+        root_len = len(self._root_path_parts)
+        if (
+            len(parts) != root_len + 3
+            or re.fullmatch(r"[0-9]{4}-(?:01|04|07|10)月新番", parts[root_len]) is None
+            or parts[root_len + 1] != "未整理"
+        ):
+            raise RemoteInventoryIncomplete(
+                "115 download source path is outside the quarter 未整理 root",
+                kind="directories", stage="download_source_path",
+            )
+        try:
+            directory_id = str(self.resolve_directory_path(normalized))
+        except RemoteDirectoryMissing:
+            return {"directory_id": None, "deleted": True,
+                    "already_applied": True, "atomic": False,
+                    "_mutation_performed": False}
+        entries = self.list_directory_entries(directory_id)
+        if not isinstance(entries, list):
+            raise RemoteInventoryIncomplete(
+                "115 download source inventory is incomplete", kind="directories",
+                stage="download_source_inventory",
+            )
+        if entries:
+            return {"directory_id": directory_id, "deleted": False,
+                    "skipped": "not_empty", "atomic": False,
+                    "_mutation_performed": False}
+        self._flat_delete_request(directory_id, kind="directories")
+        try:
+            self.resolve_directory_path(normalized)
+        except RemoteDirectoryMissing:
+            gone = True
+        except Exception:
+            gone = False
+        else:
+            gone = False
+        if not gone:
+            raise RemoteInventoryIncomplete(
+                "115 download source directory is still resolvable after delete",
+                kind="directories", stage="download_source_postwrite",
+            )
+        return {"directory_id": directory_id, "deleted": True,
+                "already_applied": False, "atomic": False,
+                "_mutation_performed": True}
+
+    def _flat_delete_request(self, directory_id: Any, *, kind: str) -> None:
+        """Issue exactly one installed SDK delete call; never infer a CAS contract."""
+
+        fn = getattr(self._client, "fs_delete", None)
+        if not callable(fn):
+            raise RemoteInventoryIncomplete(
+                "115 staging delete API is unavailable", kind=kind,
+                stage="staging_delete_request",
+            )
+        try:
+            response = fn([str(_remote_directory_id(directory_id))])
+        except Exception as exc:
+            raise _classify_remote_exception(
+                exc, kind=kind, stage="staging_delete_request",
+                message="115 staging delete outcome is unknown",
+            ) from None
+        info = _decode_remote_response(response, kind=kind)
+        if not isinstance(info, Mapping):
+            raise RemoteInventoryIncomplete(
+                "115 staging delete response has an unknown outcome", kind=kind,
+                stage="staging_delete_request",
+            )
+        if _remote_conflict_marker(info):
+            raise RemotePathConflict("115 staging delete target conflict")
+        _raise_on_failed_envelope(info, kind=kind)
+        if not _explicit_remote_success(info):
+            raise RemoteInventoryIncomplete(
+                "115 staging delete response does not confirm success", kind=kind,
+                stage="staging_delete_request",
+            )
+
+    def rename_isolated_file(
+        self,
+        identity: Mapping[str, Any],
+        parent_path: str,
+        *,
+        directory_id: Any,
+        source_basename: str,
+        target_basename: str,
+    ) -> Dict[str, Any]:
+        """Rename one file within its ID-derived private directory.
+
+        The ordinary SDK ``fs_rename`` endpoint has no conditional identity or
+        no-replace contract. This method therefore confines it to a verified
+        ``Season N/fid-<sha256(file-id)>`` directory, requires that directory's
+        complete inventory to contain only the selected file, and verifies the
+        same directory and file identity after an explicitly successful reply.
+        The caller must retain the existing dedicated-namespace/single-writer
+        operating boundary. No atomicity or general rename capability is
+        claimed here.
+
+        If a prior call already completed, the complete inventory proves that
+        state and this method returns it without issuing another write. A write
+        with an error or unrecognized response raises; organizer recovery must
+        reconcile it from a later read rather than retrying this POST blindly.
+        """
+
+        failure_stage = "isolated_rename"
+        if not isinstance(identity, Mapping):
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename identity is missing",
+                kind="files", stage=failure_stage,
+            )
+        file_id = identity.get("remote_file_id") or identity.get("file_id")
+        size_value = identity.get("size")
+        fingerprint = identity.get("fingerprint") or identity.get("etag")
+        try:
+            file_token = _remote_file_id_token(file_id)
+        except (PathMappingError, TypeError, ValueError):
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename file identity is invalid",
+                kind="files", stage=failure_stage,
+            ) from None
+
+        def positive_size(value: Any) -> int:
+            if isinstance(value, bool):
+                raise ValueError
+            if isinstance(value, int):
+                parsed = value
+            elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value):
+                parsed = int(value)
+            else:
+                raise ValueError
+            if parsed <= 0:
+                raise ValueError
+            return parsed
+
+        try:
+            expected_size = positive_size(size_value)
+        except (TypeError, ValueError):
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename size evidence is missing or invalid",
+                kind="files", stage=failure_stage,
+            ) from None
+        if not isinstance(fingerprint, str) or not fingerprint.strip():
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename fingerprint evidence is missing",
+                kind="files", stage=failure_stage,
+            )
+        try:
+            source_name = _safe_basename(source_basename, "source_basename")
+            target_name = _safe_basename(target_basename, "target_basename")
+        except (PathMappingError, TypeError, ValueError):
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename basename is invalid",
+                kind="files", stage=failure_stage,
+            ) from None
+        source_extension = posixpath.splitext(source_name)[1]
+        target_extension = posixpath.splitext(target_name)[1]
+        if not source_extension or target_extension != source_extension:
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename must preserve the source extension",
+                kind="files", stage=failure_stage,
+            )
+
+        try:
+            normalized_parent = _normalize_remote_path(
+                parent_path, kind="directories"
+            )
+            parent_parts = _remote_path_parts(normalized_parent)
+            root_parts = self._root_path_parts
+            if (
+                not root_parts
+                or tuple(parent_parts[:len(root_parts)]) != root_parts
+            ):
+                raise ValueError
+            relative_parts = parent_parts[len(root_parts):]
+            if (
+                len(relative_parts) < 2
+                or re.fullmatch(r"Season [0-9]+", relative_parts[-2]) is None
+                or relative_parts[-1] != file_token
+            ):
+                raise ValueError
+            directory_token = str(_remote_directory_id(directory_id))
+        except (RemoteInventoryIncomplete, TypeError, ValueError):
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename parent is outside its expected file namespace",
+                kind="directories", stage=failure_stage,
+            ) from None
+
+        def verified_snapshot() -> Dict[str, Any]:
+            resolved_id = str(self.resolve_directory_path(normalized_parent))
+            if resolved_id != directory_token:
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename directory identity changed",
+                    kind="directories", stage=failure_stage,
+                )
+            entries = self.list_directory_entries(directory_token)
+            if not isinstance(entries, list) or len(entries) != 1:
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename directory is not exclusively occupied",
+                    kind="files", stage=failure_stage,
+                )
+            item = entries[0]
+            if not isinstance(item, Mapping) or _item_is_directory(item):
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename inventory is not one file",
+                    kind="files", stage=failure_stage,
+                )
+            observed_id = _strict_file_id(item)
+            if observed_id in (None, "") or str(observed_id) != str(file_id):
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename file identity changed",
+                    kind="files", stage=failure_stage,
+                )
+            observed_size = _first_value(item, ("size", "s"))
+            try:
+                parsed_size = positive_size(observed_size)
+            except (TypeError, ValueError):
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename inventory has no positive file size",
+                    kind="files", stage=failure_stage,
+                ) from None
+            if parsed_size != expected_size:
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename file size changed",
+                    kind="files", stage=failure_stage,
+                )
+            observed_fingerprint = _first_value(
+                item,
+                ("fingerprint", "content_fingerprint", "sha1", "sha", "md5", "etag"),
+            )
+            if (
+                not isinstance(observed_fingerprint, str)
+                or not observed_fingerprint.strip()
+                or observed_fingerprint != fingerprint
+            ):
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename file fingerprint changed or is missing",
+                    kind="files", stage=failure_stage,
+                )
+            explicit_parent = _first_value(item, ("parent_id", "pid", "cid"))
+            if explicit_parent not in (None, "") and str(explicit_parent) != directory_token:
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename file parent identity changed",
+                    kind="files", stage=failure_stage,
+                )
+            name = _item_name(item)
+            if not name:
+                raise RemoteInventoryIncomplete(
+                    "115 isolated rename inventory has no basename",
+                    kind="files", stage=failure_stage,
+                )
+            explicit_path = _first_value(item, ("path", "full_path", "remote_path"))
+            if explicit_path not in (None, ""):
+                try:
+                    normalized_file_path = _normalize_remote_path(
+                        explicit_path, kind="files"
+                    )
+                except RemoteInventoryIncomplete:
+                    raise RemoteInventoryIncomplete(
+                        "115 isolated rename inventory has an invalid file path",
+                        kind="files", stage=failure_stage,
+                    ) from None
+                if normalized_file_path != posixpath.join(normalized_parent, name):
+                    raise RemoteInventoryIncomplete(
+                        "115 isolated rename file path changed",
+                        kind="files", stage=failure_stage,
+                    )
+            record = _normalize_file_record(item)
+            record.update({
+                "remote_file_id": str(file_id),
+                "file_id": str(file_id),
+                "parent_id": directory_token,
+                "parent_path": normalized_parent,
+                "name": name,
+                "filename": name,
+                "size": parsed_size,
+                "fingerprint": observed_fingerprint,
+            })
+            return record
+
+        current = verified_snapshot()
+        if current["name"] == target_name:
+            return current
+        if current["name"] != source_name:
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename current basename is unexpected",
+                kind="files", stage=failure_stage,
+            )
+
+        rename = getattr(self._client, "fs_rename", None)
+        if not callable(rename):
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename API is unavailable",
+                kind="files", stage=failure_stage,
+            )
+        try:
+            response = rename((str(file_id), target_name))
+        except Exception as exc:
+            raise _classify_remote_exception(
+                exc,
+                kind="files",
+                stage=failure_stage,
+                message="115 isolated rename request failed or has an unknown outcome",
+            ) from None
+        info = _decode_remote_response(response, kind="files")
+        if not isinstance(info, Mapping):
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename response has an unknown outcome",
+                kind="files", stage=failure_stage,
+            )
+        if _remote_conflict_marker(info):
+            raise RemotePathConflict("115 isolated rename target conflict")
+        _raise_on_failed_envelope(info, kind="files")
+        if not _explicit_remote_success(info):
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename response does not explicitly confirm success",
+                kind="files", stage=failure_stage,
+            )
+
+        verified = verified_snapshot()
+        if verified["name"] != target_name:
+            raise RemoteInventoryIncomplete(
+                "115 isolated rename post-write inventory does not match target",
+                kind="files", stage=failure_stage,
+            )
+        return verified
 
     def fs_mkdir(self, payload: Any, parent_id: Any = None) -> Any:
         """Call the real ``fs_mkdir`` wrapper and reject failed envelopes."""
@@ -2424,7 +3831,7 @@ def _task_items_and_total(
     if not isinstance(info, dict):
         raise RemoteInventoryIncomplete(
             "115 task-list response has no recognized envelope",
-            kind="tasks",
+            kind="tasks", stage="task_page",
         )
     containers = (info, info.get("data"))
     totals: set[int] = set()
@@ -2447,14 +3854,18 @@ def _task_items_and_total(
                 value = container.get(key)
                 if (isinstance(value, bool) or not isinstance(value, (int, str))
                         or not re.fullmatch(r"[0-9]+", str(value))):
-                    raise RemoteInventoryIncomplete("115 task pagination is malformed", kind="tasks")
+                    raise RemoteInventoryIncomplete(
+                        "115 task pagination is malformed", kind="tasks", stage="task_page"
+                    )
                 pagination.append(int(value))
             count, pages, size, page = pagination
             if (size <= 0 or page <= 0 or pages != (count + size - 1) // size
                     or page > max(1, pages)
                     or requested_page is not None and page != requested_page
                     or requested_page_size is not None and size != requested_page_size):
-                raise RemoteInventoryIncomplete("115 task pagination is contradictory", kind="tasks")
+                raise RemoteInventoryIncomplete(
+                    "115 task pagination is contradictory", kind="tasks", stage="task_page"
+                )
             sdk_pages.add((count, pages, size, page))
             totals.add(count)
             end_flags.add(page >= pages)
@@ -2464,17 +3875,23 @@ def _task_items_and_total(
             value = container[key]
             if (isinstance(value, bool) or not isinstance(value, (int, str))
                     or not re.fullmatch(r"[0-9]+", str(value))):
-                raise RemoteInventoryIncomplete("115 task inventory total is malformed", kind="tasks")
+                raise RemoteInventoryIncomplete(
+                    "115 task inventory total is malformed", kind="tasks", stage="task_page"
+                )
             totals.add(int(value))
         for key in ("has_more", "hasMore", "more", "complete", "finished", "is_last"):
             if key not in container:
                 continue
             value = container[key]
             if not isinstance(value, bool):
-                raise RemoteInventoryIncomplete("115 task inventory end marker is malformed", kind="tasks")
+                raise RemoteInventoryIncomplete(
+                    "115 task inventory end marker is malformed", kind="tasks", stage="task_page"
+                )
             end_flags.add(not value if key in ("has_more", "hasMore", "more") else value)
     if len(totals) > 1 or len(end_flags) > 1 or len(sdk_pages) > 1:
-        raise RemoteInventoryIncomplete("115 task inventory metadata is contradictory", kind="tasks")
+        raise RemoteInventoryIncomplete(
+            "115 task inventory metadata is contradictory", kind="tasks", stage="task_page"
+        )
     total = next(iter(totals), None)
     complete = next(iter(end_flags), None)
     for container in containers:
@@ -2487,19 +3904,20 @@ def _task_items_and_total(
             continue
         if tasks is None:
             continue
-        _raise_on_contradictory_total(total, len(tasks), kind="tasks")
+        _raise_on_contradictory_total(total, len(tasks), kind="tasks", stage="task_page")
         for count, _pages, size, page in sdk_pages:
             expected_items = min(size, max(0, count - (page - 1) * size))
             if len(tasks) != expected_items:
-                raise RemoteInventoryIncomplete("115 task page length is contradictory", kind="tasks")
+                raise RemoteInventoryIncomplete(
+                    "115 task page length is contradictory", kind="tasks", stage="task_page"
+                )
         return tasks, total, complete
-    # Observed live (2026-09-25): a throttled task-list response carries no
-    # recognized list at all instead of a state:false envelope.  A genuine
-    # envelope always has one, so this shape is the throttle signature, not
-    # an inventory contradiction.
-    raise RemoteRateLimited(
+    # An unknown/missing list shape is not proof of throttling. Keep it
+    # fail-closed as an unproven inventory unless the envelope supplied an
+    # explicit rate-limit signal above.
+    raise RemoteInventoryIncomplete(
         "115 task-list response has no recognized task list",
-        kind="tasks",
+        kind="tasks", stage="task_page",
     )
 
 
@@ -2511,8 +3929,149 @@ def _decode_remote_response(result: Any, *, kind: str) -> Any:
     except (TypeError, ValueError) as exc:
         raise RemoteInventoryIncomplete(
             f"115 {kind}-list response is not valid JSON",
-            kind=kind,
+            kind=kind, stage="response_envelope",
         ) from exc
+
+
+def _safe_remote_scalar(value: Any) -> Optional[str]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        value = str(value)
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", value):
+        return None
+    return value
+
+
+def _http_status_from_mapping(info: Mapping[str, Any]) -> Optional[int]:
+    for key in ("http_status", "status_code", "status"):
+        value = info.get(key)
+        if isinstance(value, str) and re.fullmatch(r"[0-9]{3}", value):
+            value = int(value)
+        if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+            return value
+    return None
+
+
+def _remote_code_from_mapping(info: Mapping[str, Any]) -> Optional[str]:
+    for key in ("remote_code", "errNo", "errno", "error_code", "errorCode", "code"):
+        if key in info:
+            code = _safe_remote_scalar(info.get(key))
+            if code is not None:
+                return code
+    return None
+
+
+def _exception_metadata(exc: BaseException) -> tuple[Optional[int], Optional[str]]:
+    """Extract only bounded scalar status/code metadata from an SDK error."""
+
+    try:
+        response = getattr(exc, "response", None)
+    except Exception:
+        response = None
+    status = None
+    for owner, names in (
+        (exc, ("http_status", "status_code", "status")),
+        (response, ("http_status", "status_code", "status")),
+    ):
+        if owner is None:
+            continue
+        for name in names:
+            try:
+                value = getattr(owner, name, None)
+            except Exception:
+                continue
+            if isinstance(value, str) and re.fullmatch(r"[0-9]{3}", value):
+                value = int(value)
+            if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+                status = value
+                break
+        if status is not None:
+            break
+    if status is None and type(exc).__module__ == "urllib.error":
+        value = getattr(exc, "code", None)
+        if isinstance(value, int) and not isinstance(value, bool) and 100 <= value <= 599:
+            status = value
+    remote_code = None
+    for name in ("remote_code", "error_code", "errorCode", "errNo", "errno"):
+        try:
+            remote_code = _safe_remote_scalar(getattr(exc, name, None))
+        except Exception:
+            continue
+        if remote_code is not None:
+            break
+    return status, remote_code
+
+
+def _is_authentication_code(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    normalized = value.upper().replace("-", "_")
+    return normalized in {
+        "990001", "401", "403", "UNAUTHORIZED", "AUTH_EXPIRED",
+        "TOKEN_EXPIRED", "INVALID_TOKEN",
+    }
+
+
+def _is_rate_limit_code(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    normalized = value.upper().replace("-", "_")
+    return normalized in {
+        "980005", "429", "RATE_LIMIT", "RATE_LIMITED",
+        "TOO_MANY_REQUEST", "TOO_MANY_REQUESTS",
+    }
+
+
+def _is_retryable_transport_exception(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, ConnectionError, socket.gaierror)):
+        return True
+    module = type(exc).__module__.lower()
+    name = type(exc).__name__.lower()
+    if module.startswith(("requests.exceptions", "httpx", "aiohttp", "urllib3.exceptions")):
+        if any(token in name for token in ("timeout", "connection", "transport", "protocol", "network", "maxretry")):
+            return True
+    if isinstance(exc, urllib.error.URLError):
+        reason = getattr(exc, "reason", None)
+        return isinstance(reason, (TimeoutError, ConnectionError, socket.gaierror))
+    return False
+
+
+def _classify_remote_exception(
+    exc: BaseException,
+    *,
+    kind: str,
+    stage: str,
+    message: str,
+) -> RemoteInventoryIncomplete:
+    """Classify known transport/auth failures; unknown SDK errors fail closed."""
+
+    status, remote_code = _exception_metadata(exc)
+    if status in (401, 403) or _is_authentication_code(remote_code):
+        return RemoteAuthenticationError(
+            "115 remote authentication failed", kind=kind, stage=stage,
+            http_status=status, remote_code=remote_code,
+        )
+    if status == 429 or _is_rate_limit_code(remote_code):
+        return RemoteRateLimited(
+            "115 remote request was rate limited", kind=kind, stage=stage,
+            http_status=status, remote_code=remote_code,
+        )
+    if (
+        status in (408, 425)
+        or (status is not None and 500 <= status <= 599)
+        or _is_retryable_transport_exception(exc)
+    ):
+        return RemoteServiceUnavailable(
+            message, kind=kind, stage=stage,
+            http_status=status, remote_code=remote_code,
+        )
+    return RemoteInventoryIncomplete(
+        message, kind=kind, stage=stage,
+        http_status=status, remote_code=remote_code,
+    )
 
 
 def _trusted_total(info: Any) -> Optional[int]:
@@ -2610,7 +4169,10 @@ def _complete_directory_listing_pages(
     response = first
     for page in range(max_pages):
         if not isinstance(response, Mapping):
-            raise RemoteRateLimited("115 directory page is malformed", kind="directories")
+            raise RemoteInventoryIncomplete(
+                "115 directory page has an unrecognized response shape",
+                kind="directories", stage="directory_page",
+            )
         _raise_on_failed_envelope(response, kind="directories")
         entries = response.get("data")
         total = response.get("count")
@@ -2622,23 +4184,32 @@ def _complete_directory_listing_pages(
             or offset != len(all_entries)
             or any(not isinstance(item, Mapping) for item in entries)
         ):
-            # Observed live (2026-09-25): throttled responses arrive as
-            # structurally broken envelopes for a known-good directory id,
-            # while genuine directories always return well-formed pages.
-            raise RemoteRateLimited("115 directory page is incomplete", kind="directories")
+            raise RemoteInventoryIncomplete(
+                "115 directory page metadata is malformed or incomplete",
+                kind="directories", stage="directory_page",
+                http_status=_http_status_from_mapping(response),
+                remote_code=_remote_code_from_mapping(response),
+            )
         if expected_total is None:
             expected_total = total
         elif total != expected_total:
-            raise RemoteInventoryIncomplete("115 directory count changed during listing", kind="directories")
+            raise RemoteInventoryIncomplete(
+                "115 directory count changed during listing",
+                kind="directories", stage="directory_page",
+            )
         if len(all_entries) + len(entries) > total:
-            raise RemoteInventoryIncomplete("115 directory count is contradictory", kind="directories")
+            raise RemoteInventoryIncomplete(
+                "115 directory count is contradictory",
+                kind="directories", stage="directory_page",
+            )
         all_entries.extend(entries)
         if len(all_entries) == total:
             return all_entries
         if not entries:
-            # A declared total with an empty page is the classic truncated
-            # rate-limit response, not a completed listing.
-            raise RemoteRateLimited("115 directory page made no progress", kind="directories")
+            raise RemoteInventoryIncomplete(
+                "115 directory page made no progress before its declared total",
+                kind="directories", stage="directory_page",
+            )
         try:
             response = _decode_remote_response(
                 request({"cid": directory_id, "offset": len(all_entries), "limit": page_size}),
@@ -2647,8 +4218,14 @@ def _complete_directory_listing_pages(
         except RemoteInventoryIncomplete:
             raise
         except Exception as exc:
-            raise RemoteRateLimited("115 directory next page failed", kind="directories") from exc
-    raise RemoteInventoryIncomplete("115 directory page cap reached", kind="directories")
+            raise _classify_remote_exception(
+                exc, kind="directories", stage="directory_page",
+                message="115 directory next-page request failed",
+            ) from None
+    raise RemoteInventoryIncomplete(
+        "115 directory page safety cap reached before completion",
+        kind="directories", stage="directory_page",
+    )
 
 
 def _raise_on_missing_or_duplicate_listing_identities(entries: list) -> None:
@@ -2712,6 +4289,21 @@ def _envelope_state_failed(info: Mapping[str, Any]) -> bool:
     )
 
 
+def _explicit_remote_success(info: Mapping[str, Any]) -> bool:
+    """Require a positive state/success marker for a single remote mutation."""
+    for key in ("state", "success"):
+        value = info.get(key)
+        if value is True:
+            return True
+        if isinstance(value, int) and not isinstance(value, bool) and value == 1:
+            return True
+        if isinstance(value, str) and value.strip().casefold() in {
+            "1", "true", "ok", "success",
+        }:
+            return True
+    return False
+
+
 def _envelope_reports_rate_limit(info: Mapping[str, Any]) -> bool:
     """Whether a failed envelope's errNo/error text marks transport throttling.
 
@@ -2720,8 +4312,8 @@ def _envelope_reports_rate_limit(info: Mapping[str, Any]) -> bool:
     Those report transport pacing, not an inventory contradiction, so they
     must not spend the review budget.
     """
-    errno_text = str(info.get("errNo", info.get("errno", ""))).strip()
-    if errno_text == "980005":
+    remote_code = _remote_code_from_mapping(info)
+    if _is_rate_limit_code(remote_code):
         return True
     error_text = str(info.get("error", "")).strip()
     return (
@@ -2732,25 +4324,33 @@ def _envelope_reports_rate_limit(info: Mapping[str, Any]) -> bool:
 
 
 def _raise_on_failed_envelope(info: Mapping[str, Any], *, kind: str) -> None:
-    if not _envelope_state_failed(info):
-        return
-    if str(info.get("errno", "")) == "990001":
-        raise RemoteInventoryIncomplete(
-            "115 authentication expired", kind=kind,
+    http_status = _http_status_from_mapping(info)
+    remote_code = _remote_code_from_mapping(info)
+    failed = _envelope_state_failed(info)
+    if http_status in (401, 403) or _is_authentication_code(remote_code):
+        raise RemoteAuthenticationError(
+            "115 authentication or access was rejected",
+            kind=kind, stage="response_envelope",
+            http_status=http_status, remote_code=remote_code,
         )
-    if _envelope_reports_rate_limit(info):
-        error_text = str(info.get("error", "")).strip()
-        errno_text = str(
-            info.get("errNo", info.get("errno", ""))
-        ).strip()
+    if http_status == 429 or _envelope_reports_rate_limit(info):
         raise RemoteRateLimited(
-            f"115 {kind}-list response reports rate limiting: "
-            + (error_text[:120] or f"errNo {errno_text}"),
-            kind=kind,
+            f"115 {kind}-list response reports rate limiting",
+            kind=kind, stage="response_envelope",
+            http_status=http_status, remote_code=remote_code,
         )
+    if http_status in (408, 425) or (http_status is not None and 500 <= http_status <= 599):
+        raise RemoteServiceUnavailable(
+            f"115 {kind}-list service is unavailable",
+            kind=kind, stage="response_envelope",
+            http_status=http_status, remote_code=remote_code,
+        )
+    if not failed:
+        return
     raise RemoteInventoryIncomplete(
-        f"115 {kind}-list response reports failure",
-        kind=kind,
+        f"115 {kind}-list response reports an unclassified failure",
+        kind=kind, stage="response_envelope",
+        http_status=http_status, remote_code=remote_code,
     )
 
 
@@ -2821,11 +4421,13 @@ def _raise_on_failed_envelope_deep(info: Mapping[str, Any], *, kind: str) -> Non
             _raise_on_failed_envelope_deep(nested, kind=kind)
 
 
-def _raise_on_contradictory_total(total: Optional[int], consumed: int, *, kind: str) -> None:
+def _raise_on_contradictory_total(
+    total: Optional[int], consumed: int, *, kind: str, stage: Optional[str] = None
+) -> None:
     if total is not None and consumed > 0 and total < consumed:
         raise RemoteInventoryIncomplete(
             f"115 {kind}-list response has contradictory total",
-            kind=kind,
+            kind=kind, stage=stage,
         )
 
 

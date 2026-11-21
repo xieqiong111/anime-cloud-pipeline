@@ -346,6 +346,11 @@ class PipelineRunner:
         ):
             raise ValueError("writable runner requires a current-quarter window")
 
+        from .qualified_scope import (allowed_identities, identity_allowed, canonical_identity,
+                                     restrict_for_reviews, QualifiedScopeError)
+        from .throttle import CloudCooldownStateError
+        from .safe_diagnostics import safe_blocker_details
+        qualified_identities = allowed_identities(window)
         backfill_scope = normalize_backfill_scope(window)
         download = self.stage_services.get("download")
         scope_setter = getattr(download, "set_scope", None)
@@ -364,6 +369,13 @@ class PipelineRunner:
                 summary["skipped_lock"] = True
                 return summary
         try:
+            if qualified_identities is not None:
+                qualified_identities = restrict_for_reviews(qualified_identities, self.store.all_episodes())
+                window = dict(window)
+                scope = dict(window["qualified_scope"])
+                scope["runnable"] = [row for row in scope["runnable"]
+                                     if identity_allowed(row, qualified_identities)]
+                window["qualified_scope"] = scope
             if discover and self.discovery is not None:
                 plan = self.discovery.prepare(window, read_only=read_only)
                 summary["discovery"] = dict(getattr(plan, "summary", {}) or {})
@@ -380,10 +392,83 @@ class PipelineRunner:
                     return summary
 
             episodes = list(self.store.all_episodes())
+            if qualified_identities is not None:
+                qualified_identities = restrict_for_reviews(qualified_identities, episodes)
+            # Reconcile submitted/uncertain downloads before any new intent.
+            # Freeze the phase for this bounded snapshot: a later invocation
+            # takes a fresh inventory after mappings have been committed.
+            def submission_attempted(row):
+                checker = getattr(download, "_submission_attempted", None)
+                if callable(checker):
+                    return bool(checker(int(row["id"]), row))
+                return bool(row.get("submit_count") or row.get("remote_task_id"))
+
+            def reconciling(row):
+                status = _status_text(row.get("status") or row.get("stage"))
+                if status in {"submitting", "uncertain", "downloading"}:
+                    # The canonical DownloadService cannot consume legacy
+                    # states. Report them explicitly instead of freezing new
+                    # work forever while pretending reconciliation can run.
+                    raise QualifiedScopeError("download_reconciliation_state_unsupported")
+                if status == "submitted":
+                    return True
+                if status != "download_pending":
+                    return False
+                return submission_attempted(row)
+
+            reconcile_ids = set()
+            defer_fresh_downloads = False
+            for candidate in episodes:
+                if (not identity_allowed(candidate, qualified_identities)
+                        or not episode_in_backfill_scope(candidate, backfill_scope)):
+                    continue
+                quarter = window.get("season_quarter") if isinstance(window, Mapping) else None
+                if quarter:
+                    reader = getattr(self.store, "get_subscription_season_air_date", None)
+                    date = reader(int(candidate["id"])) if callable(reader) else ""
+                    try:
+                        label = season_label_from_air_date(date)
+                    except SeasonRoutingError:
+                        label = ""
+                    if not label.startswith(str(quarter) + "月"):
+                        continue
+                if reconciling(candidate):
+                    reconcile_ids.add(int(candidate["id"]))
+            episodes.sort(key=lambda row: (
+                0 if int(row["id"]) in reconcile_ids else
+                2 if _status_text(row.get("status") or row.get("stage")) in {"download_pending", "discovered"} else 1,
+                int(row["id"]),
+            ))
+            summary["reconciliation_pending"] = len(reconcile_ids)
+            queue_setter = getattr(download, "set_check_queue", None)
+            if callable(queue_setter) and not read_only:
+                check_queue = []
+                quarter = window.get("season_quarter") if isinstance(window, Mapping) else None
+                for candidate in episodes:
+                    if (_status_text(candidate.get("status") or candidate.get("stage")) not in {"download_pending", "submitted"}
+                            or not identity_allowed(candidate, qualified_identities)
+                            or not episode_in_backfill_scope(candidate, backfill_scope)
+                            or _retry_not_due(candidate, self.now())):
+                        continue
+                    if quarter:
+                        reader = getattr(self.store, "get_subscription_season_air_date", None)
+                        season_date = reader(int(candidate["id"])) if callable(reader) else ""
+                        try:
+                            label = season_label_from_air_date(season_date)
+                        except SeasonRoutingError:
+                            label = ""
+                        if not label.startswith(str(quarter) + "月"):
+                            continue
+                    if not reconcile_ids or int(candidate["id"]) in reconcile_ids:
+                        check_queue.append(int(candidate["id"]))
+                queue_setter(check_queue)
             processed_ids: set[int] = set()
             for episode in episodes:
+                if qualified_identities is not None:
+                    qualified_identities = restrict_for_reviews(qualified_identities, self.store.all_episodes())
                 snapshot = dict(episode)
-                if not episode_in_backfill_scope(snapshot, backfill_scope):
+                if (not episode_in_backfill_scope(snapshot, backfill_scope)
+                        or not identity_allowed(snapshot, qualified_identities)):
                     summary["skipped"] += 1
                     continue
                 try:
@@ -399,7 +484,10 @@ class PipelineRunner:
                 if current is None:
                     summary["skipped"] += 1
                     continue
-                if not episode_in_backfill_scope(dict(current), backfill_scope):
+                if qualified_identities is not None and canonical_identity(dict(current)) is None:
+                    raise QualifiedScopeError("qualified_identity_became_unknown")
+                if (not episode_in_backfill_scope(dict(current), backfill_scope)
+                        or not identity_allowed(dict(current), qualified_identities)):
                     summary["skipped"] += 1
                     continue
                 compatibility_getter = getattr(self.store, "get_by_id", None)
@@ -411,7 +499,10 @@ class PipelineRunner:
                     if compatible is not None:
                         current = compatible
                 row = dict(current)
-                if not episode_in_backfill_scope(row, backfill_scope):
+                if qualified_identities is not None and canonical_identity(row) is None:
+                    raise QualifiedScopeError("qualified_identity_became_unknown")
+                if (not episode_in_backfill_scope(row, backfill_scope)
+                        or not identity_allowed(row, qualified_identities)):
                     summary["skipped"] += 1
                     continue
                 quarter = window.get("season_quarter") if isinstance(window, Mapping) else None
@@ -448,6 +539,12 @@ class PipelineRunner:
                     summary["skipped"] += 1
                     summary["skipped_retry"] += 1
                     continue
+                if (status == "download_pending"
+                        and episode_id not in reconcile_ids
+                        and (reconcile_ids or defer_fresh_downloads)):
+                    summary["skipped"] += 1
+                    summary["deferred_new_downloads"] = summary.get("deferred_new_downloads", 0) + 1
+                    continue
                 handler = self.handlers.get(status)
                 if handler is None:
                     summary["skipped"] += 1
@@ -457,8 +554,15 @@ class PipelineRunner:
                     summary["skipped_read_only"] += 1
                     summary.add_handler(status + ":read_only")
                     continue
+                fresh_download = (
+                    status == "download_pending" and episode_id not in reconcile_ids
+                )
+                attempted_before = submission_attempted(row) if fresh_download else None
+                result = None
+                handler_completed = False
                 try:
                     result = handler(row, summary)
+                    handler_completed = True
                     reason = _result_reason(result)
                     if reason == "submission_budget_exhausted":
                         summary["skipped"] += 1
@@ -482,6 +586,24 @@ class PipelineRunner:
                     else:
                         summary["advanced"] += 1
                     summary.add_handler(status)
+                    detail = safe_blocker_details(_result_detail(result))
+                    if detail and (reason in {"pre_submit_inventory_present", "pre_submit_inventory_unknown",
+                                               "pre_submit_inventory_error", "download_inventory_failed"}
+                                   or detail.get("category")):
+                        summary["blocker_details"] = detail
+                    category = detail.get("category") if detail else None
+                    if category in {"authentication", "transport", "rate_limit", "inventory_incomplete"}:
+                        summary["stop_reason"] = {
+                            "authentication": "cloud_authentication_failed",
+                            "transport": "cloud_read_unavailable",
+                            "rate_limit": "cloud_read_rate_limited",
+                            "inventory_incomplete": "cloud_inventory_incomplete",
+                        }[category]
+                        throttle = getattr(download, "throttle_state", None)
+                        until = getattr(throttle, "throttled_until", None)
+                        if isinstance(until, (int, float)):
+                            summary["cooldown_until"] = until
+                        break
                     latest = self.store.get_episode(int(row["id"])) or {}
                     summary.add_stage(_status_text(latest.get("status") or status))
                     if (reason == "pre_submit_inventory_present"
@@ -495,6 +617,8 @@ class PipelineRunner:
                                   "pre_submit_inventory_error"}:
                         summary["stop_reason"] = reason
                         break
+                except CloudCooldownStateError:
+                    raise
                 except Exception as exc:
                     summary["errors"] += 1
                     try:
@@ -507,8 +631,51 @@ class PipelineRunner:
                             "failed to persist retry evidence id=%s stage=%s: %s",
                             row.get("id"), status, _safe_runner_error(persist_exc),
                         )
+                        if qualified_identities is not None:
+                            raise QualifiedScopeError("qualified_review_state_unavailable") from None
                     summary.add_handler(status + ":error")
+                finally:
+                    if fresh_download:
+                        try:
+                            latest_after = self.store.get_episode(episode_id)
+                            if latest_after is None:
+                                raise LookupError("episode missing after download handler")
+                            latest_after = dict(latest_after)
+                            actual_status = _status_text(
+                                latest_after.get("status") or latest_after.get("stage")
+                            )
+                            attempted_after = submission_attempted(latest_after)
+                        except Exception:
+                            raise QualifiedScopeError(
+                                "download_submission_state_unavailable"
+                            ) from None
+                        result_reason = _result_reason(result) if result is not None else ""
+                        if (
+                            result_reason == "download_submission_uncertain"
+                            or (result_reason == "download_submitted" and actual_status == "submitted")
+                            or (attempted_before is False and attempted_after is True)
+                            or (not handler_completed and attempted_after is not False)
+                        ):
+                            # A new or unresolved submit can change remote
+                            # inventory before ownership mappings are refreshed.
+                            # Leave remaining fresh downloads for the next snapshot,
+                            # while allowing non-download handlers in this one to run.
+                            defer_fresh_downloads = True
+                    if qualified_identities is not None:
+                        try:
+                            fresh = list(self.store.all_episodes())
+                            qualified_identities = restrict_for_reviews(qualified_identities, fresh)
+                        except QualifiedScopeError:
+                            raise
+                        except Exception:
+                            raise QualifiedScopeError("qualified_review_state_unavailable") from None
+        except (QualifiedScopeError, CloudCooldownStateError) as exc:
+            summary["stop_reason"] = str(exc)
+            return summary
         finally:
+            queue_clearer = getattr(download, "clear_check_queue", None)
+            if callable(queue_clearer) and not read_only:
+                queue_clearer()
             if acquired:
                 self.lock.release()
         return summary
@@ -565,6 +732,23 @@ class PipelineRunner:
         return self._invoke_service(organizer, row, ("reconcile_or_apply", "advance"), summary)
 
     def _handle_organized(self, row: Mapping[str, Any], summary: RunSummary) -> None:
+        organizer = self.stage_services.get("organize")
+        capability = getattr(getattr(organizer, "cloud", None),
+                             "supports_flat_season_move", None)
+        requires_flat = callable(capability) and capability() is True
+        if requires_flat:
+            import json
+            runtime = row.get("runtime_identity_json") or {}
+            runtime = json.loads(runtime) if isinstance(runtime, str) else runtime
+            layout = runtime.get("_cloud_layout_intent") if isinstance(runtime, Mapping) else None
+            if (not isinstance(layout, Mapping) or layout.get("verified") is not True
+                    or layout.get("staging_archive_verified") is not True
+                    or row.get("cloud_path") != layout.get("to_cloud_path")):
+                _runner_transition(
+                    self.store, int(row["id"]), EpisodeStatus.ORGANIZE_PENDING.value,
+                    {"reason": "flat_layout_finalize_required"}, secrets=self.secrets,
+                )
+                return
         _runner_transition(
             self.store, int(row["id"]), EpisodeStatus.STRM_PENDING.value,
             {"reason": "strm_intent"}, secrets=self.secrets,

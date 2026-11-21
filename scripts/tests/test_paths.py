@@ -253,15 +253,15 @@ class PathMapperTests(unittest.TestCase):
         # ``整理`` must map to the *existing* v3 published path with no doubled
         # segment, and its raw LitePan path must equal the real scan output.
         mapper = PathMapper(PATHS_LIBRARY_SUBDIR)
-        cloud = "/影视库/动画/2026-07月新番/整理/示例动画/Season 1/示例动画 - S01E10.mkv"
+        cloud = "/影视库/动画/2026-07月新番/整理/再见菈菈/Season 1/再见菈菈 - S01E10.mkv"
 
         self.assertEqual(
             mapper.cloud_to_litepan(cloud),
-            "/lite/out/2026-07月新番/整理/示例动画/Season 1/示例动画 - S01E10.strm",
+            "/lite/out/2026-07月新番/整理/再见菈菈/Season 1/再见菈菈 - S01E10.strm",
         )
         self.assertEqual(
             mapper.cloud_to_raw_litepan(cloud, "/lite/raw"),
-            "/lite/raw/2026-07月新番/整理/示例动画/Season 1/示例动画 - S01E10.strm",
+            "/lite/raw/2026-07月新番/整理/再见菈菈/Season 1/再见菈菈 - S01E10.strm",
         )
 
     def test_new_download_cloud_target_places_library_subdir_after_quarter(self):

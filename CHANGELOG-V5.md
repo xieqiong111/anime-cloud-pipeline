@@ -38,6 +38,56 @@ Private configurations, databases, NAS operation scripts and live evidence remai
 outside the public repository. Earlier full-suite baseline failures below remain
 disclosed; no new full-suite-green claim is made.
 
+## 5.4.9 — Backfill episode stills the day after airing
+
+- Add `pipeline.episode_stills.backfill_episode_stills`: after a `run`, any
+  `library_ready` episode whose `<stem>.jpg` is missing is filled from TMDB
+  `still_path`, but only when its `air_date` is earlier than the current
+  Asia/Shanghai date, so a same-day premiere is deferred to the next run.
+- Never overwrite an existing image, cap the pass at 20 episodes, and contain
+  every failure so the run exit status is unchanged.
+- Read the deployment secret `config/bootstrap-secrets/tmdb.json`
+  (`api_key`, optional `proxy`) instead of a new config section, so
+  `configDigest` and the acceptance baseline stay stable.
+
+## 5.4.8 — Episode-still tolerance and anchor-scoped acceptance digest
+
+- Treat a missing episode still as optional when the episode NFO and all other
+  required sidecars are verified (`complete_without_episode_image`), so a
+  freshly aired episode whose scraper emitted no `S01E01.jpg` still reaches
+  `library_ready` instead of exhausting scrape retries.
+- Scope the layout verifier's `selectionInventoryDigest` to the ten anchor
+  episodes (`episode_sources`/linked `download_files`) instead of the whole
+  tables, matching the already anchor-scoped `reviewsDigest`; adding a new
+  episode no longer fails `verify` on baseline invariants alone.
+- Rebase the pinned scheduler digest after an operator-side crontab edit and
+  document that a cron pin change needs both the helper `CRON_SHA` and the
+  runner `APPLY_HELPER_SHA` updated together.
+
+## 5.4.7 — Delete the emptied staging directory after a flat move
+
+- Replace the empty-directory archive move with an in-place delete: the
+  Organizer verifies the staging directory is the owned empty fid directory,
+  issues one `fs_delete`, and proves absence by re-listing the Season instead
+  of resolving a path that no longer exists.
+- Record `staging_archive_state: "deleted"` alongside the retained
+  `staging_archive_path`, and let plan, history closure and independent
+  verification accept either an archived empty directory or a verified
+  deletion.
+- Allow read-only `cloud-layout` and `cloud-names` through the diagnostic
+  command allowlist so `plan` no longer fails with
+  `unsupported diagnostic command`.
+
+## 5.4.6 — Emby index lag and authorized review recovery
+
+- Document that a just-written STRM can appear in Emby with empty ProviderIds
+  until the library scan finishes, so exact identity matching fails on timing,
+  not on remote state. Check Emby before spending retries.
+- State that such a review blocks the matched subscription by design and that
+  recovery needs a per-review operator authorization: read-only Emby check,
+  `reviews resolve` with generation and `action=retry`, then
+  `run --resume-only --backfill` and re-verification.
+
 ## 5.4.5 — independent V5 runtime and quarter preparation
 
 - Add subscription qualification, read-only resource planning, and explicitly

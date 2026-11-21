@@ -88,9 +88,6 @@ _CONFIG_COMMANDS = {
     "preflight",
     "migrate",
     "dry-run",
-    "qualify",
-    "plan-resources",
-    "prepare-resources",
     "run",
     "status",
     "reviews",
@@ -136,10 +133,6 @@ _DEFAULT_CREDENTIAL_ENVIRONMENT = frozenset(
 )
 _FIXED_ENVIRONMENT = _DEFAULT_REQUIRED_ENVIRONMENT | _DEFAULT_CREDENTIAL_ENVIRONMENT
 _PROCESS_ONLY_ENVIRONMENT = frozenset({"ANIME_PIPELINE_PYTHON"})
-_RESOURCE_AUTHORIZATION_ENVIRONMENT = frozenset(
-    {"OCTOP_PIPELINE_ALLOW_RESOURCES", "OCTOP_PIPELINE_RESOURCE_REVISION"}
-)
-_RESOURCE_REVISION = re.compile(r"[0-9a-f]{64}\Z")
 _FORBIDDEN_ENVIRONMENT = frozenset(
     {"ANIME_PIPELINE_PYTHON", "PYTHONPATH", "PYTHONHOME", "LD_PRELOAD"}
 )
@@ -504,38 +497,7 @@ def _configured_environment_names(config_path: Path) -> set[str]:
                 names.add(reference)
             continue
         raise EnvFileError("deployment configuration has an unsupported credential name")
-    if names & _RESOURCE_AUTHORIZATION_ENVIRONMENT:
-        raise EnvFileError(
-            "deployment configuration uses reserved resource authorization names"
-        )
     return names
-
-
-def _resource_apply_authorization(
-    arguments: Sequence[str], caller_environment: Mapping[str, str]
-) -> dict[str, str]:
-    """Pass one-shot resource authorization only to an explicit apply command.
-
-    These names are intentionally excluded from the configured dotenv allowlist.
-    A valid authorization must arrive in this process environment, alongside
-    the exact command and apply flag; other commands never inherit it.
-    """
-
-    if (
-        not arguments
-        or arguments[0] != "prepare-resources"
-        or "--apply" not in arguments[1:]
-    ):
-        return {}
-    if caller_environment.get("OCTOP_PIPELINE_ALLOW_RESOURCES") != "1":
-        return {}
-    revision = caller_environment.get("OCTOP_PIPELINE_RESOURCE_REVISION")
-    if not isinstance(revision, str) or not _RESOURCE_REVISION.fullmatch(revision):
-        return {}
-    return {
-        "OCTOP_PIPELINE_ALLOW_RESOURCES": "1",
-        "OCTOP_PIPELINE_RESOURCE_REVISION": revision,
-    }
 
 
 def _sanitized_child_detail(
@@ -864,9 +826,6 @@ def main(
             for name, value in merged_environment.items()
             if name not in _PROCESS_ONLY_ENVIRONMENT
         }
-        runtime_environment.update(
-            _resource_apply_authorization(arguments, caller_environment)
-        )
         if command == "doctor":
             report = run_doctor(layout, runtime_environment)
             _print_json({"command": "doctor", **report.as_dict()})

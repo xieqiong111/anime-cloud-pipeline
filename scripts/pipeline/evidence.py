@@ -246,6 +246,7 @@ class SidecarEvidence:
 
         values: dict[str, Any] = {}
         missing: list[str] = []
+        missing_names: list[str] = []
         for name, path in paths.items():
             present, content = _read_exact(self.files, path)
             if content is _READ_ERROR:
@@ -254,6 +255,7 @@ class SidecarEvidence:
                 return _failure("symlink", path=_safe_path(path, self.secrets))
             if not present or _empty_content(content):
                 missing.append(_safe_path(path, self.secrets))
+                missing_names.append(name)
             else:
                 values[name] = content
 
@@ -296,6 +298,18 @@ class SidecarEvidence:
                 "paths_by_role": {name: _safe_path(path, self.secrets)
                                   for name, path in verified.items()},
             })
+
+        if missing_names == ["episode_image"] and "episode_nfo" in values:
+            return EvidenceResult(
+                True,
+                detail={
+                    "reason": "complete_without_episode_image",
+                    "paths": [_safe_path(path, self.secrets)
+                              for name, path in paths.items() if name != "episode_image"],
+                    "required_count": len(paths),
+                    "optional_missing": ["episode_image"],
+                },
+            )
 
         if missing:
             return EvidenceResult(

@@ -27,7 +27,7 @@ class InventoryTests(unittest.TestCase):
                          runtime=NS(litepan_task_source_root='/cloud/organized/' + self.label,
                                     litepan_task_output_root=str(raw / self.label),
                                     emby_library_root=str(published / self.label), emby_library_name='quarter'))
-        self.row = {'id': 1, 'media_source': 'tmdb', 'media_id': '12345', 'season': 1, 'episode': 1}
+        self.row = {'id': 1, 'media_source': 'tmdb', 'media_id': '311842', 'season': 1, 'episode': 1}
         db = sqlite3.connect(':memory:')
         self.addCleanup(db.close)
         db.executescript('''CREATE TABLE episodes_v5 (id INTEGER,media_source TEXT,media_id TEXT,season INTEGER,episode INTEGER,cloud_path TEXT,strm_path TEXT);
@@ -47,7 +47,7 @@ class InventoryTests(unittest.TestCase):
 
     def own(self, *, other=False, path='/cloud/organized/2026-10月新番/video.mkv', remote_id='fid', host_path=None):
         self.store.conn.execute('INSERT INTO episodes_v5 VALUES(1,?,?,?,?,?,?)',
-                                ('tmdb', '99' if other else '12345', 1, 1, path, host_path))
+                                ('tmdb', '99' if other else '311842', 1, 1, path, host_path))
         self.store.conn.execute('INSERT INTO download_files VALUES(1,?,?)', (remote_id, path))
         self.store.conn.execute('INSERT INTO episode_sources VALUES(1,1,1)')
 
@@ -116,7 +116,7 @@ class InventoryTests(unittest.TestCase):
         self.emby.iter_episodes.return_value = [{'SeriesId': 's', 'ParentIndexNumber': 1, 'IndexNumber': 1,
                                                 'Path': '/some/different/path'}]
         self.assertEqual(self.prove()['state'], 'unknown')
-        self.emby._series_provider_map.return_value = {'s': '12345'}
+        self.emby._series_provider_map.return_value = {'s': '311842'}
         self.assertEqual(self.prove()['state'], 'present')
         self.emby._series_provider_map.return_value = {'s': '123'}
         self.assertEqual(self.prove()['state'], 'missing')

@@ -18,7 +18,8 @@ import time
 
 READ_ONLY_BUDGET_SECONDS = 150.0
 LABELS = frozenset({
-    "preflight", "dry-run", "qualify", "plan-resources", "config", "runtime", "state.snapshot", "discovery",
+    "preflight", "dry-run", "qualify", "scope-check", "plan-resources", "cloud-names", "cloud-layout",
+    "config", "runtime", "state.snapshot", "discovery",
     "litepan.tasks", "115.initialize", "115.capabilities", "115.source_root",
     "115.quarter_library_root", "115.request", "emby.library",
     "moviepilot.subscriptions", "moviepilot.media_detail", "moviepilot.request", "moviepilot.season_episodes",
@@ -92,7 +93,8 @@ def stage(label: str, **facts: object):
 
 @contextmanager
 def read_only_command(command: str):
-    if command not in {"preflight", "dry-run", "qualify", "plan-resources"}:
+    if command not in {"preflight", "dry-run", "qualify", "scope-check", "plan-resources",
+                      "cloud-names", "cloud-layout"}:
         raise ValueError("unsupported diagnostic command")
     started = time.monotonic()
     context = _Context(command, started, started + READ_ONLY_BUDGET_SECONDS, command)

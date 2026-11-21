@@ -2,7 +2,7 @@
 name: anime-cloud-pipeline
 description: Use for V5 pipeline operations, previews, authorized current-quarter resource preparation, recovery, review, and troubleshooting from a checkout or authorized deployment.
 metadata:
-  version: 5.4.5
+  version: 5.4.9
   tags: [anime, moviepilot, p115, litepan, emby, strm, sqlite]
   category: media
 ---
@@ -107,6 +107,15 @@ not completion. The stable flow is
 organized → strm_pending → strm_ready → scrape_pending → metadata_ready →
 library_pending → library_ready → notified`.
 
+Sidecar acceptance covers episode NFO, episode image, show NFO/poster and
+season NFO/poster. A missing episode still (`<stem>.jpg`) is tolerated only
+when the episode NFO and every other required sidecar are already verified; the
+result records reason `complete_without_episode_image` and
+`optional_missing: ["episode_image"]`. Scrapers can emit no still for a
+just-aired episode, and an image-only gap must not hold the library edge.
+
+Stills are backfilled one day after airing. At the end of every `run`, missing `<stem>.jpg` files of `library_ready` episodes are fetched from TMDB using the deployment secret `config/bootstrap-secrets/tmdb.json` (`api_key`, optional `proxy`). Only episodes whose `air_date` is earlier than the current Asia/Shanghai date are touched; existing images are never overwritten, at most 20 episodes per run, and any failure leaves the run result unchanged.
+
 `needs_review` stores a resume status and reason. Retryable failures retain a
 recoverable pending state; uncertain remote inventory never proves absence.
 Reviews require reason-specific JSON and transactional compare-and-set
@@ -114,14 +123,65 @@ resolution. Claim an episode ready only after exact path and identity evidence
 for every stage; HTTP success, task submission, refresh acceptance, or a lone
 STRM file is insufficient.
 
-For new 115 selections, Organizer creates an isolated directory under the
-target `Season N`, records its remote directory ID, verifies that it is empty,
-and moves the selected file by remote file ID. It keeps the original basename
-and never invokes an undocumented rename primitive. Recovery rechecks the
-directory ID and selected file identity before continuing. LitePan scans the
-nested cloud path recursively; the pipeline publishes its STRM at the standard
-`Season N` path for MoviePilot and Emby. The LitePan raw task output and the
-published STRM root must be separate directories.
+For new 115 selections, Organizer uses `fid-*` only as temporary isolated
+staging for a same-file basename rename. Its final cloud layout is
+`Work/Season N/Work - S01E01.ext`: videos are directly inside Season, with no
+final per-file directory. After complete Season ownership and file-ID, size,
+fingerprint, parent-ID and basename checks, the serial writer moves the video
+by ID into Season and verifies the entire before/after inventory. It then
+deletes the verified empty fid directory in place (`fs_delete`) instead of
+moving it into the quarter's `.pipeline-staging`: the intent keeps
+`staging_archive_path` for audit and records
+`staging_archive_state: "deleted"`, and the delete is proven by re-listing the
+Season and failing to list the removed directory. 115 retains the deleted
+directory in its recycle bin, so recovery by ID is still possible.
+
+`cloud-layout --config ...` previews qualified existing files; `--id N --apply`
+backs up state and persists a bounded intent before using this same Organizer.
+The original selected download record and old name witness remain immutable.
+Only a sealed file move plus a closed empty-directory deletion (archive state
+`deleted`, verified) or a closed empty-directory archive, with both closed
+history edges, may advance to STRM. LitePan raw output, published STRM, metadata and exact
+Emby identity/path must be revalidated through the normal runner. The daily
+scheduler remains the sole owner; this command neither creates a schedule nor
+resolves reviews. The LitePan raw and published roots remain separate.
+
+The installed move endpoint has no proven server-side no-replace or atomic
+contract. Keep the Season namespace dedicated to the pipeline, use the existing
+run lock and a single writer, reject unknown entries or name conflicts, and
+reconcile uncertain outcomes by ID after the normal cooldown. Do not repeat a
+write merely because its acknowledgement was lost.
+
+### Emby indexing lag at the library stage
+
+A STRM written moments ago is not immediately matchable. Emby can list the
+episode while its `ProviderIds` are still empty until the library scan
+finishes, so exact identity matching fails on freshly written files even though the
+cloud path, STRM, raw content and metadata are all correct. Observed
+2026-11-14 on TMDB 283938 S01E06: `last_reason=episode_provider_ids_empty`
+after three retries, `retry_exhausted`, review opened at generation 1, and the
+whole 283938 subscription became blocked while 311842 was unaffected.
+
+Treat this symptom as timing, not as an unknown remote state:
+
+- Before spending retries, confirm the episode is visible in Emby with the
+  expected TMDB provider ID and canonical path; if it is not, wait for the next
+  snapshot or trigger the library scan instead of re-running the stage.
+- A review opened this way still blocks the matched subscription by design.
+  Do not resolve it inside a daily run and do not widen scope around it.
+
+Recovery needs an explicit, per-review operator authorization:
+
+1. Read-only verify the Emby item: provider ID and `Season N/Work - S01E0N.ext`
+   path both match the intended identity.
+2. `reviews resolve --config <cfg> --id <review_id> --generation <g>
+   --resolution '{"action":"retry","note":"<reason>"}'`.
+3. `run --resume-only --backfill <media_source>:<season>:<ep>-<ep>`.
+4. Re-check the exact Emby identity/path and that the state reached
+   `library_ready`; record the authorization and evidence.
+
+Never resolve reviews outside the declared quarter, and never reuse one
+authorization for another episode.
 
 ## Commands
 

@@ -1,4 +1,7 @@
 """Offline bootstrap regressions: fixtures only, never invoke the pipeline."""
+import contextlib
+import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -10,6 +13,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts'))
+sys.path.insert(0, str(ROOT / 'bin'))
 import v5_bootstrap as bootstrap
 
 
@@ -153,6 +157,75 @@ class BootstrapTests(unittest.TestCase):
             with self.assertRaises(bootstrap.BootstrapError):
                 bootstrap.resolve_environment(fixture())
             self.assertEqual(dict(os.environ), before)
+
+    def test_launcher_import_is_inert_and_failure_never_starts_pipeline(self):
+        spec = importlib.util.spec_from_file_location('fixture_run_v5', ROOT / 'bin/run_v5.py')
+        launcher = importlib.util.module_from_spec(spec)
+        with mock.patch('subprocess.check_output') as docker:
+            spec.loader.exec_module(launcher)
+            docker.assert_not_called()
+        stderr = io.StringIO()
+        with mock.patch.object(launcher, 'load_bootstrap', side_effect=bootstrap.BootstrapError('V5_BOOTSTRAP_CONFIG_INVALID')), \
+                mock.patch('subprocess.check_output') as docker, contextlib.redirect_stderr(stderr):
+            self.assertEqual(launcher.main(['preflight']), 2)
+            docker.assert_not_called()
+        self.assertEqual(stderr.getvalue(), 'V5_BOOTSTRAP_CONFIG_INVALID\n')
+
+
+    def test_launcher_success_stays_in_memory_and_forwards_arguments(self):
+        spec = importlib.util.spec_from_file_location('fixture_run_v5_success', ROOT / 'bin/run_v5.py')
+        launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launcher)
+        config = fixture()
+        config['moviepilot']['token_env'] = 'API_TOKEN'
+        for existing_api_token in (None, 'existing-token'):
+            env = {'FIXTURE_COOKIE': 'fixture-cookie', 'FIXTURE_LITEPAN': 'fixture-litepan',
+                   'FIXTURE_EMBY': 'fixture-emby'}
+            if existing_api_token is not None:
+                env['API_TOKEN'] = existing_api_token
+            pipeline = mock.Mock()
+            pipeline.main.return_value = 17
+            output = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True), \
+                    mock.patch.dict(sys.modules, {'run_pipeline': pipeline}), \
+                    mock.patch.object(launcher, 'load_bootstrap', return_value=config), \
+                    mock.patch('subprocess.check_output', return_value=b'container-token\n') as docker, \
+                    mock.patch('builtins.open', mock.mock_open(read_data='PROXY_HOST=http://proxy.local\n')) as opened, \
+                    contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                self.assertEqual(launcher.main(['preflight', '--fixture']), 17)
+                pipeline.main.assert_called_once_with(['preflight', '--fixture'])
+                self.assertEqual(os.environ['MOVIEPILOT_TOKEN'], existing_api_token or 'container-token')
+                self.assertEqual(os.environ['P115_ROOT_DIRECTORY_ID'], '123')
+                self.assertEqual(os.environ['HTTPS_PROXY'], 'http://proxy.local')
+                if existing_api_token:
+                    docker.assert_not_called()
+                else:
+                    self.assertEqual(docker.call_args.args[0],
+                                     ['docker', 'exec', 'moviepilot-v3', 'printenv', 'API_TOKEN'])
+                opened.assert_called_once_with(launcher.HOST_CONFIG + '/app.env', encoding='utf-8')
+            self.assertEqual(output.getvalue(), '')
+
+
+    def test_launcher_explicit_empty_api_token_fails_without_container_fallback(self):
+        spec = importlib.util.spec_from_file_location('fixture_run_v5_empty_token', ROOT / 'bin/run_v5.py')
+        launcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(launcher)
+        config = fixture()
+        config['moviepilot']['token_env'] = 'API_TOKEN'
+        env = {'API_TOKEN': '', 'FIXTURE_COOKIE': 'fixture-cookie',
+               'FIXTURE_LITEPAN': 'fixture-litepan', 'FIXTURE_EMBY': 'fixture-emby'}
+        pipeline = mock.Mock()
+        output = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.dict(sys.modules, {'run_pipeline': pipeline}), \
+                mock.patch.object(launcher, 'load_bootstrap', return_value=config), \
+                mock.patch('subprocess.check_output') as docker, \
+                contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            self.assertEqual(launcher.main(['preflight']), 2)
+            docker.assert_not_called()
+            pipeline.main.assert_not_called()
+            self.assertEqual(dict(os.environ), env)
+        self.assertEqual(output.getvalue(), 'V5_BOOTSTRAP_SECRET_UNAVAILABLE\n')
 
 
 if __name__ == '__main__':

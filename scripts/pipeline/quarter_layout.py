@@ -11,6 +11,9 @@ from .paths import PathMapper, season_label_from_air_date
 def build_layout(raw_config, config):
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     label = season_label_from_air_date(now.date().isoformat())
+    # Library display names drop the year prefix ("十月新番") while every
+    # directory keeps the year-qualified label ("2026-10月新番").
+    emby_label = label.split("-", 1)[-1] if "-" in label else label
     quarter = label[:7]
     paths = config.paths
     raw_base = paths.litepan_raw_output_root
@@ -38,7 +41,7 @@ def build_layout(raw_config, config):
         "runtime.litepan_task_source_root": cloud_quarter,
         "runtime.litepan_task_output_root": raw_dir,
         "runtime.litepan_event_name": event_name,
-        "runtime.emby_library_name": label,
+        "runtime.emby_library_name": emby_label,
         "runtime.emby_library_root": emby_dir,
     }
     return {

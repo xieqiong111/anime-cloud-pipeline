@@ -35,8 +35,20 @@ class RemoteInventoryIncomplete(RuntimeError):
     as proof that an item is absent remotely.
     """
 
-    def __init__(self, message: str = "remote inventory incomplete", *, kind: str = "remote") -> None:
+    def __init__(
+        self,
+        message: str = "remote inventory incomplete",
+        *,
+        kind: str = "remote",
+        stage: Optional[str] = None,
+        http_status: Optional[int] = None,
+        remote_code: Optional[str] = None,
+    ) -> None:
         self.kind = str(kind)
+        self.category = "inventory_incomplete"
+        self.stage = _safe_remote_stage(stage)
+        self.http_status = _safe_remote_http_status(http_status)
+        self.remote_code = _safe_remote_code(remote_code)
         super().__init__(str(message))
 
 
@@ -45,12 +57,102 @@ class RemoteDirectoryMissing(RemoteInventoryIncomplete):
 
 
 class RemoteRateLimited(RemoteInventoryIncomplete):
-    """A 115 read failed at the transport level (throttle or outage).
+    """A remote response explicitly identifies request throttling.
 
     Unlike an inventory contradiction, this says nothing about what the
     directory actually contains: the caller should back off and retry later
     instead of spending the episode's contradiction review budget.
     """
+
+    def __init__(
+        self,
+        message: str = "remote request rate limited",
+        *,
+        kind: str = "remote",
+        stage: Optional[str] = None,
+        http_status: Optional[int] = None,
+        remote_code: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            message,
+            kind=kind,
+            stage=stage,
+            http_status=http_status,
+            remote_code=remote_code,
+        )
+        self.category = "rate_limit"
+
+
+class RemoteServiceUnavailable(RemoteRateLimited):
+    """A retryable transport or server failure with no inventory proof.
+
+    It remains a ``RemoteRateLimited`` for existing cooling/backoff handlers,
+    while ``category`` distinguishes an outage from explicit throttling.
+    """
+
+    def __init__(
+        self,
+        message: str = "remote service unavailable",
+        *,
+        kind: str = "remote",
+        stage: Optional[str] = None,
+        http_status: Optional[int] = None,
+        remote_code: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            message,
+            kind=kind,
+            stage=stage,
+            http_status=http_status,
+            remote_code=remote_code,
+        )
+        self.category = "transport"
+
+
+class RemoteAuthenticationError(RemoteInventoryIncomplete):
+    """A remote inventory request was rejected by authentication or access."""
+
+    def __init__(
+        self,
+        message: str = "remote authentication failed",
+        *,
+        kind: str = "remote",
+        stage: Optional[str] = None,
+        http_status: Optional[int] = None,
+        remote_code: Optional[str] = None,
+    ) -> None:
+        super().__init__(
+            message,
+            kind=kind,
+            stage=stage,
+            http_status=http_status,
+            remote_code=remote_code,
+        )
+        self.category = "authentication"
+
+
+def _safe_remote_stage(value: Optional[str]) -> Optional[str]:
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    if all(ch.isascii() and (ch.isalnum() or ch in "_.-") for ch in value):
+        return value
+    return None
+
+
+def _safe_remote_http_status(value: Optional[int]) -> Optional[int]:
+    if isinstance(value, bool) or not isinstance(value, int) or not 100 <= value <= 599:
+        return None
+    return value
+
+
+def _safe_remote_code(value: Optional[str]) -> Optional[str]:
+    if isinstance(value, int) and not isinstance(value, bool):
+        value = str(value)
+    if not isinstance(value, str) or not value or len(value) > 64:
+        return None
+    if all(ch.isascii() and (ch.isalnum() or ch in "_.-") for ch in value):
+        return value
+    return None
 
 
 class RemotePathConflict(RuntimeError):
@@ -476,6 +578,18 @@ class EmbyAdapter:
 class EmbyInventoryError(RuntimeError):
     """The Emby inventory cannot prove a complete, safe answer."""
 
+    EPISODE_PROVIDER_IDS_EMPTY = "episode_provider_ids_empty"
+
+    def __init__(self, *args: Any, reason: str | None = None) -> None:
+        # Keep RuntimeError's positional-argument behavior for existing callers.
+        # Only fixed, explicitly recognized reasons cross the service boundary.
+        self.reason = (
+            reason
+            if reason == self.EPISODE_PROVIDER_IDS_EMPTY
+            else None
+        )
+        super().__init__(*args)
+
 
 class EmbyMatchAmbiguous(RuntimeError):
     """Two equal-ranked Emby episodes satisfy the requested identity."""
@@ -530,8 +644,13 @@ def _validate_emby_item_contract(item: Mapping[str, Any]) -> None:
     if type(series_id) is not str or not series_id.strip():
         raise EmbyInventoryError("Emby episode inventory entry lacks SeriesId")
     provider_ids = item.get("ProviderIds", item.get("provider_ids"))
-    if type(provider_ids) is not dict or not provider_ids:
+    if type(provider_ids) is not dict:
         raise EmbyInventoryError("Emby episode inventory entry lacks ProviderIds")
+    if not provider_ids:
+        raise EmbyInventoryError(
+            "Emby episode inventory entry has empty ProviderIds",
+            reason=EmbyInventoryError.EPISODE_PROVIDER_IDS_EMPTY,
+        )
     for key, value in provider_ids.items():
         if type(key) is not str or not key.strip():
             raise EmbyInventoryError("Emby ProviderIds key is malformed")

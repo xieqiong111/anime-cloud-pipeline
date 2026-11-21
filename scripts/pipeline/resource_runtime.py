@@ -102,20 +102,6 @@ def _read_config(path: Path) -> tuple[bytes, os.stat_result]:
     return content, info
 
 
-def _resource_plan_revision(original: bytes, quarter: str) -> str:
-    """Bind a plan token to both exact config bytes and its frozen quarter."""
-
-    quarter_bytes = quarter.encode("utf-8")
-    payload = (
-        b"anime-cloud-pipeline-resource-plan-v1\0"
-        + len(quarter_bytes).to_bytes(4, "big")
-        + quarter_bytes
-        + len(original).to_bytes(8, "big")
-        + original
-    )
-    return hashlib.sha256(payload).hexdigest()
-
-
 def _patch(raw: dict[str, Any], values: dict[str, str]) -> dict[str, Any]:
     if set(values) != set(CONFIG_FIELDS) or any(type(value) is not str for value in values.values()):
         raise ValueError("configuration_patch_invalid")
@@ -272,7 +258,7 @@ def run_resource_preparation(
             return blocked("quarter_invalid")
         commit = _ConfigCommit(config_path, raw_config, layout["patch"])
         changes = commit.changes
-        revision = _resource_plan_revision(commit.original, layout["quarter"])
+        revision = hashlib.sha256(commit.original).hexdigest()
     except Exception:
         return blocked("configuration_snapshot_invalid")
     if apply and approved_revision != revision:

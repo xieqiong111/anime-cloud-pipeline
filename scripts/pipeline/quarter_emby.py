@@ -1,7 +1,6 @@
 """Bounded quarter-library administration; runtime owns write authorization.
 
-The verified Emby 4.9.5.0 UI defines the supported creation contract.
-Public API reference: https://dev.emby.media/reference/RestAPI.html
+The installed 4.9.5.0 UI is the creation contract (see evidence/emby-api.md).
 No scan/refresh endpoint is called. Exceptions and public results use fixed codes.
 """
 from __future__ import annotations

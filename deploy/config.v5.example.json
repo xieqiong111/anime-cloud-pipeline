@@ -3,11 +3,14 @@
   "services": {
     "moviepilot": {
       "name": "moviepilot",
-      "base_url": "https://moviepilot.example.invalid",
+      "base_url": "http://127.0.0.1:3000",
       "token_env": "MOVIEPILOT_TOKEN",
       "auth_mode": "x-api-key",
       "media_source": "tmdb",
-      "subscription_sources": ["admin", "Bangumi订阅"]
+      "subscription_sources": [
+        "Bangumi订阅",
+        "admin"
+      ]
     },
     "cloud": {
       "name": "p115",
@@ -16,33 +19,32 @@
     },
     "litepan": {
       "name": "litepan",
-      "base_url": "https://litepan.example.invalid",
+      "base_url": "http://127.0.0.1:5211",
       "api_key_env": "LITEPAN_API_KEY",
-      "task_name": "anime-strm"
+      "task_name": "追番"
     },
     "emby": {
       "name": "emby",
-      "base_url": "https://emby.example.invalid",
+      "base_url": "http://emby.example:8097",
       "api_key_env": "EMBY_API_KEY",
-      "library_name": "Anime"
+      "library_name": "<emby-library-name>"
     }
   },
   "source": {
     "name": "kisssub",
     "kind": "kisssub",
-    "base_url": "https://source.example.invalid"
+    "base_url": "https://www.kisssub.org"
   },
   "paths": {
-    "cloud_source_root": "/<cloud-root>/source",
-    "cloud_library_root": "/<cloud-root>/library",
-    "cloud_library_subdir": "整理",
-    "litepan_output_root": "/<litepan-output-root>",
-    "litepan_raw_output_root": "/<litepan-task-host-output-root>",
+    "cloud_source_root": "/<cloud-root>/<quarter-label>/未整理",
+    "cloud_library_root": "/<cloud-root>",
+    "litepan_output_root": "/<litepan-strm-root>",
     "moviepilot_mount_root": "/<moviepilot-mount-root>",
-    "emby_mount_root": "/<emby-mount-root>",
-    "state_directory": "/<state-directory>"
+    "emby_mount_root": "/<litepan-strm-root>",
+    "state_directory": "/<state-directory>",
+    "litepan_raw_output_root": "/<litepan-raw-root>",
+    "cloud_library_subdir": "整理"
   },
-  "discovery": {"anime_guard": {"enabled": true}},
   "scoring": {
     "include_weight": 10,
     "language_weight": 5,
@@ -56,12 +58,10 @@
     "max_task_pages": 20,
     "max_recursive_depth": 8,
     "max_recursive_files": 1000,
-    "max_new_tasks_per_run": 4,
-    "max_new_tasks_per_subscription": 2,
-    "global_submission_limit": 4,
-    "per_subscription_submission_limit": 2,
-    "max_review_batch": 50,
-    "max_reconcile_batch": 50,
+    "max_new_tasks_per_run": 5,
+    "max_new_tasks_per_subscription": 5,
+    "max_review_batch": 5,
+    "max_reconcile_batch": 5,
     "max_cloud_checks_per_run": 8
   },
   "retry": {
@@ -71,19 +71,19 @@
     "jitter_seconds": 0.25
   },
   "runtime": {
-    "litepan_task_name": "anime-strm",
-    "litepan_task_source_root": "/<cloud-root>/library/<quarter-label>",
-    "litepan_task_output_root": "/<litepan-task-host-output-root>/<quarter-label>",
+    "litepan_task_name": "<litepan-task-name>",
+    "emby_library_name": "<emby-library-name>",
+    "reconcile_batch": 5,
+    "litepan_task_source_root": "/<cloud-root>/<quarter-label>",
+    "litepan_task_output_root": "/<litepan-raw-root>/<quarter-label>",
     "litepan_task_db_path": "/<litepan-host-data>/litepan.db",
     "litepan_strm_host_root": "/<litepan-host-strm-root>",
-    "litepan_event_name": "anime_ready",
-    "litepan_event_source": "hermes",
-    "emby_library_name": "<quarter-library-name>",
-    "emby_library_root": "/<emby-mount-root>/<quarter-label>",
-    "reconcile_batch": 50
+    "litepan_event_name": "<litepan-event-name>",
+    "litepan_event_source": "<litepan-event-source>",
+    "emby_library_root": "/<litepan-strm-root>/<quarter-label>"
   },
   "schedule": {
     "timezone": "Asia/Shanghai",
-    "cron": "0 2 * * *"
+    "cron": "0 4 * * *"
   }
 }

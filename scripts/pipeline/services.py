@@ -8,25 +8,36 @@ in state, logs, or exception details.
 """
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
+import fcntl
 import json
+import hashlib
 import math
 import os
 import posixpath
 import random
+import re
 import stat
 import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from typing import Any, Callable, Iterable
+from urllib.parse import unquote, urlsplit
 
-from .adapters import RemoteInventoryIncomplete, RemoteRateLimited
+from .adapters import EmbyInventoryError, RemoteInventoryIncomplete, RemoteRateLimited
 from .evidence import EvidenceResult, SidecarEvidence, StrmEvidence
 from .http import retry_delay
+from .media_inventory import (
+    _cloud_layout_history_closed,
+    _valid_cloud_layout_intent,
+)
 from .models import EpisodeKey, EpisodeStatus, ReviewReason
-from .paths import PathMapper, PathMappingError
+from .paths import PathMapper, PathMappingError, _remote_file_id_token
+from .safe_diagnostics import safe_exception_diagnostics, safe_inventory_diagnostics
 from .security import REDACTED, sanitize_text
-from .throttle import CloudThrottleState, throttle_decision
+from .throttle import CloudThrottleState, CloudCooldownStateError, throttle_decision
 from .video import VideoSelector
 
 
@@ -374,6 +385,7 @@ class DownloadService:
         # Cloud reads this run actually issued (passed the budget gate) —
         # surfaced in the run summary so pacing is auditable.
         self.cloud_checks_used = 0
+        self._check_queue: frozenset[int] | None = None
         self.retry = _retry_settings(
             retry_policy,
             max_attempts=retry_max_attempts,
@@ -389,51 +401,38 @@ class DownloadService:
         self.video_selector = video_selector or VideoSelector()
         self.target_episodes = target_episodes
 
+    def set_check_queue(self, episode_ids: Iterable[int]) -> None:
+        """Bind one runner turn to at most its configured number of real rows."""
+        ids = sorted(set(episode_ids))
+        self.cloud_checks_used = 0
+        if self.cloud_check_budget is not None:
+            # Rank the actual queue, not sparse numeric episode IDs. Every
+            # nonempty queue gets work; a small queue is admitted in full.
+            if self.backfill_scope is None:
+                ids.sort(key=lambda episode_id: hashlib.sha256(
+                    f"{self.rotation_seed}:{episode_id}".encode("ascii")
+                ).digest())
+            ids = ids[:max(0, self.cloud_check_budget)]
+        self._check_queue = frozenset(ids)
+
+    def clear_check_queue(self) -> None:
+        self._check_queue = None
+
     def _cloud_check_gate(self, pending_status: str, episode_id: int) -> Any | None:
-        """Reserve one per-run 115 read, or return a no-retry pending result.
+        """Keep account cooldown and a hard per-turn download-check budget.
 
-        The budget caps how many reconcile/inventory reads one run issues so a
-        large backlog cannot turn a single run into a request burst that trips
-        the account-level 115 rate limit.  Admission is hashed per episode:
-        ``(episode_id + rotation_seed) % (budget * 8)`` below the budget wins
-        the window, so about one eighth of the backlog earns a read on every
-        run at any queue depth — not just the first entries.  The seed rotates
-        per cron cycle, so successive runs cover different subsets, and the
-        same (episode_id, seed) pair always yields the same decision without
-        knowing the queue length.  Two no-retry outcomes exist:
-        ``cloud_check_cooldown`` while the shared account cooldown is active,
-        and ``cloud_check_deferred`` for episodes outside this run's budget
-        window — waiting is pacing, not failure, so retry attempts and backoff
-        stay untouched either way.
+        The runner binds a window from its eligible pending queue. Direct
+        callers without a queue use the same configured cap in call order.
+        An unspecified budget retains the existing unbounded compatibility
+        mode; production supplies its validated finite limit.
         """
-
-        if self.backfill_scope is not None:
-            # An explicitly bounded invocation has no background queue to
-            # rotate through. Keep account pacing and the hard read budget.
-            if self.throttle_state.active(float(self.now())):
-                return ServiceResult(
-                    pending_status, detail={"reason": "cloud_check_cooldown"}
-                )
-            if self.cloud_check_budget is not None and self.cloud_checks_used >= self.cloud_check_budget:
-                return ServiceResult(
-                    pending_status, detail={"reason": "cloud_check_budget_exhausted"}
-                )
-            self.cloud_checks_used += 1
-            return None
-        if self.cloud_check_budget is None:
-            return None
-        now_value = float(self.now())
-        if self.throttle_state.active(now_value):
-            return ServiceResult(
-                pending_status, detail={"reason": "cloud_check_cooldown"}
-            )
-        window = max(1, self.cloud_check_budget)
-        spread = window * 8
-        slot = (int(episode_id) + self.rotation_seed) % spread
-        if slot >= window:
-            return ServiceResult(
-                pending_status, detail={"reason": "cloud_check_deferred"}
-            )
+        if self.throttle_state.active(float(self.now())):
+            return ServiceResult(pending_status, detail={"reason": "cloud_check_cooldown"})
+        if (self.cloud_check_budget is not None
+                and self.cloud_checks_used >= self.cloud_check_budget):
+            return ServiceResult(pending_status, detail={"reason": "cloud_check_budget_exhausted"})
+        if self._check_queue is not None and int(episode_id) not in self._check_queue:
+            return ServiceResult(pending_status, detail={"reason": "cloud_check_deferred"})
         self.cloud_checks_used += 1
         return None
 
@@ -551,14 +550,27 @@ class DownloadService:
             # consecutive-throttle streak here so intermittent throttling
             # never accumulates into the sustained "consecutive 20" review.
             self.throttle_state.reset()
+        except CloudCooldownStateError:
+            raise
         except RemoteRateLimited as exc:
-            detail = {"reason": "download_reconcile_failed", "error": _safe_error(exc)}
-            status_value = self._throttle_pending(
-                self.store, episode_id, EpisodeStatus.DOWNLOAD_PENDING.value, row, detail
+            diagnostics = safe_exception_diagnostics(exc, stage="download_reconcile")
+            detail = {"reason": "download_reconcile_failed", **diagnostics}
+            if diagnostics.get("category") in {"rate_limit", "transport"}:
+                status_value = self._throttle_pending(
+                    self.store, episode_id, EpisodeStatus.DOWNLOAD_PENDING.value, row, detail
+                )
+                return ServiceResult(status_value, detail=detail)
+            pending_status = _retry_pending(
+                self.store, episode_id, EpisodeStatus.DOWNLOAD_PENDING.value, row,
+                detail, now=self.now, base=self.retry_base_seconds,
+                cap=self.retry_max_seconds, secrets=self.secrets,
             )
-            return ServiceResult(status_value, detail=detail)
+            return ServiceResult(pending_status, detail=detail)
         except Exception as exc:
-            detail = {"reason": "download_reconcile_failed", "error": _safe_error(exc)}
+            detail = {
+                "reason": "download_reconcile_failed",
+                **safe_exception_diagnostics(exc, stage="download_reconcile"),
+            }
             pending_status = _retry_pending(
                 self.store, episode_id, EpisodeStatus.DOWNLOAD_PENDING.value, row,
                 detail, now=self.now, base=self.retry_base_seconds,
@@ -586,19 +598,51 @@ class DownloadService:
 
         if self.pre_submit_inventory is not None:
             reason = "pre_submit_inventory_unknown"
+            inventory_details: dict[str, Any] | None = None
+            exception_details: dict[str, Any] = {}
             try:
                 inventory = self.pre_submit_inventory(dict(row)) if callable(finder) else None
-                state = inventory.get("state") if isinstance(inventory, Mapping) else None
+                inventory_details = safe_inventory_diagnostics(inventory, stage="scope")
+                state = inventory_details["state"]
                 if state == "present":
                     reason = "pre_submit_inventory_present"
                 elif state == "missing":
                     reason = ""
-            except Exception:
+            except Exception as exc:
                 reason = "pre_submit_inventory_error"
+                exception_details = safe_exception_diagnostics(
+                    exc, stage="pre_submit_inventory",
+                )
             if reason:
                 detail = {"reason": reason}
-                _transition(self.store, episode_id, EpisodeStatus.DOWNLOAD_PENDING.value,
-                            detail, secrets=self.secrets)
+                if inventory_details is not None:
+                    detail.update({
+                        "subreason": inventory_details["reason"],
+                        "counts": inventory_details["counts"],
+                        "inventory_stage": inventory_details["inventory_stage"],
+                    })
+                    for name in (
+                        "category", "exception_type", "stage", "kind",
+                        "http_status", "remote_code",
+                    ):
+                        if name in inventory_details:
+                            detail[name] = inventory_details[name]
+                detail.update(exception_details)
+                category = (
+                    inventory_details.get("category") if inventory_details is not None
+                    else exception_details.get("category")
+                )
+                if (reason != "pre_submit_inventory_present"
+                        and category in {"rate_limit", "transport"}):
+                    pending_status = self._throttle_pending(
+                        self.store, episode_id, EpisodeStatus.DOWNLOAD_PENDING.value,
+                        row, detail,
+                    )
+                    return ServiceResult(pending_status, detail=detail)
+                _transition(
+                    self.store, episode_id, EpisodeStatus.DOWNLOAD_PENDING.value,
+                    detail, secrets=self.secrets,
+                )
                 return ServiceResult(EpisodeStatus.DOWNLOAD_PENDING.value, detail=detail)
 
         subscription_id = str(row.get("subscription_id") or "episode")
@@ -687,14 +731,27 @@ class DownloadService:
             # throttling never accumulates into the sustained "consecutive 20"
             # review.
             self.throttle_state.reset()
+        except CloudCooldownStateError:
+            raise
         except RemoteRateLimited as exc:
-            detail = {"reason": "download_inventory_failed", "error": _safe_error(exc)}
-            status_value = self._throttle_pending(
-                self.store, episode_id, EpisodeStatus.SUBMITTED.value, row, detail
+            diagnostics = safe_exception_diagnostics(exc, stage="download_inventory")
+            detail = {"reason": "download_inventory_failed", **diagnostics}
+            if diagnostics.get("category") in {"rate_limit", "transport"}:
+                status_value = self._throttle_pending(
+                    self.store, episode_id, EpisodeStatus.SUBMITTED.value, row, detail
+                )
+                return ServiceResult(status_value, detail=detail)
+            pending_status = _retry_pending(
+                self.store, episode_id, EpisodeStatus.SUBMITTED.value, row,
+                detail, now=self.now, base=self.retry_base_seconds,
+                cap=self.retry_max_seconds, secrets=self.secrets,
             )
-            return ServiceResult(status_value, detail=detail)
+            return ServiceResult(pending_status, detail=detail)
         except Exception as exc:
-            detail = {"reason": "download_inventory_failed", "error": _safe_error(exc)}
+            detail = {
+                "reason": "download_inventory_failed",
+                **safe_exception_diagnostics(exc, stage="download_inventory"),
+            }
             pending_status = _retry_pending(
                 self.store, episode_id, EpisodeStatus.SUBMITTED.value, row,
                 detail, now=self.now, base=self.retry_base_seconds,
@@ -991,6 +1048,27 @@ class StrmService:
     def advance(self, episode: Any) -> ServiceResult:
         row = _with_retry_settings(_episode_row(self.store, episode), self.retry)
         episode_id = _episode_id(row)
+        runtime = _runtime_identity(row)
+        layout_intent = runtime.get('_cloud_layout_intent')
+        if (_has_fid_cloud_parent(row.get('cloud_path')) or layout_intent is not None):
+            record = _layout_proof_record(row, self.store)
+            if (record is None
+                    or not _valid_cloud_layout_intent(record, runtime, layout_intent)
+                    or not _cloud_layout_history_closed(
+                        self.store, record, runtime, layout_intent, 10000,
+                    )):
+                detail = {'reason': 'flat_layout_not_closed'}
+                _transition_pending(
+                    self.store, episode_id, EpisodeStatus.ORGANIZE_PENDING.value,
+                    detail,
+                    extra={
+                        'cloud_path': row.get('cloud_path'),
+                        'runtime_identity_json': runtime,
+                        'strm_path': row.get('strm_path'),
+                    },
+                    secrets=self.secrets,
+                )
+                return ServiceResult(EpisodeStatus.ORGANIZE_PENDING.value, detail=detail)
         strm_path = self._strm_path(row)
         if not strm_path:
             detail = {"reason": "canonical_strm_path_missing"}
@@ -1193,7 +1271,8 @@ class StrmService:
         if not isinstance(self.files, str):
             return EvidenceResult(False, detail={"reason": "strm_publisher_unavailable"})
         _publish_local_strm(
-            raw_path, target, self.mapper.roots.litepan_output_root, self.raw_output_root
+            raw_path, target, self.mapper.roots.litepan_output_root,
+            self.raw_output_root, rename_row=row, state_store=self.store,
         )
         return StrmEvidence(self.files, secrets=self.secrets).validate(target)
 
@@ -1599,17 +1678,24 @@ class LibraryService:
 
         identity = _emby_identity(row)
         identity["library_id"] = library_id
+        metadata_refresh_required = False
         try:
             item = self._find_episode(identity, expected_path)
         except Exception as exc:
-            detail = {"reason": "emby_query_failed", "error": _safe_error(exc)}
-            pending_status = _retry_pending(
-                self.store, episode_id, EpisodeStatus.LIBRARY_PENDING.value, row,
-                detail, now=self.now, base=self.retry_base_seconds,
-                cap=self.retry_max_seconds, secrets=self.secrets,
-                extra={"library_id": library_id, "library_path": self.library_root},
-            )
-            return ServiceResult(pending_status, detail=detail)
+            if not (
+                isinstance(exc, EmbyInventoryError)
+                and exc.reason == EmbyInventoryError.EPISODE_PROVIDER_IDS_EMPTY
+            ):
+                detail = {"reason": "emby_query_failed", "error": _safe_error(exc)}
+                pending_status = _retry_pending(
+                    self.store, episode_id, EpisodeStatus.LIBRARY_PENDING.value, row,
+                    detail, now=self.now, base=self.retry_base_seconds,
+                    cap=self.retry_max_seconds, secrets=self.secrets,
+                    extra={"library_id": library_id, "library_path": self.library_root},
+                )
+                return ServiceResult(pending_status, detail=detail)
+            item = None
+            metadata_refresh_required = True
 
         if item:
             detail = {
@@ -1631,7 +1717,14 @@ class LibraryService:
             )
             return ServiceResult(EpisodeStatus.LIBRARY_READY.value, detail=detail)
 
-        absent = {"reason": "emby_exact_episode_absent", "library_id": library_id}
+        absent = {
+            "reason": (
+                EmbyInventoryError.EPISODE_PROVIDER_IDS_EMPTY
+                if metadata_refresh_required
+                else "emby_exact_episode_absent"
+            ),
+            "library_id": library_id,
+        }
         refresh_now = float(self.now())
         if _not_due(row, refresh_now):
             return ServiceResult(
@@ -1643,10 +1736,10 @@ class LibraryService:
             and int(row.get("retry_count") or 0) >= self.retry.max_attempts
         ):
             detail = {
+                **absent,
                 "reason": "retry_exhausted",
                 "attempts": int(row.get("retry_count") or 0),
                 "last_reason": absent["reason"],
-                **absent,
             }
             _open_review(
                 self.store,
@@ -2062,10 +2155,427 @@ def _canonical_strm_path(
     return canonical
 
 
-def _publish_local_strm(
-    source: str, target: str, output_root: str, raw_output_root: str
+def _strict_litepan_file_reference(content: bytes) -> tuple[tuple[Any, ...], str, str] | None:
+    """Parse the one unsigned LitePan file-ID URL format accepted for migration."""
+
+    try:
+        text = content.decode("utf-8").rstrip("\r\n")
+        if len(text) > 8192 or any(ord(char) <= 32 for char in text):
+            return None
+        url = urlsplit(text)
+        if (url.scheme not in {"http", "https"} or not url.hostname
+                or url.username is not None or url.password is not None
+                or "?" in text or "#" in text):
+            return None
+        match = re.fullmatch(
+            r"/api/strm/play/([1-9][0-9]{0,18})/([A-Za-z0-9_-]{1,80})"
+            r"/t/([^/\s]{1,512})/n/([^/?#\s]{1,2048})", url.path,
+        )
+        if match is None:
+            return None
+        decoded = base64.b64decode(
+            match[2] + "=" * ((-len(match[2])) % 4), altchars=b"-_", validate=True,
+        )
+        file_id = decoded.decode("ascii")
+        if (not re.fullmatch(r"[1-9][0-9]{0,24}", file_id)
+                or base64.urlsafe_b64encode(decoded).decode().rstrip("=") != match[2]):
+            return None
+        name = unquote(match[4], errors="strict")
+        if (not name or "/" in name or "\\" in name
+                or any(ord(char) < 32 for char in name)):
+            return None
+        port = url.port if url.port is not None else (443 if url.scheme == "https" else 80)
+        if port == 0:
+            return None
+        context = (url.scheme, url.hostname.casefold(), port, match[1], match[3])
+        return context, file_id, name
+    except (UnicodeError, ValueError):
+        return None
+
+
+def _strict_positive_size(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        normalized = int(value)
+        return normalized if normalized > 0 else None
+    return None
+
+
+def _layout_proof_record(
+    row: Mapping[str, Any], state_store: Any,
+) -> dict[str, Any] | None:
+    """Attach the immutable selected inventory row needed by layout proofs."""
+    episode_id = row.get('id')
+    if isinstance(episode_id, bool) or not isinstance(episode_id, int):
+        return None
+    conn = getattr(state_store, 'conn', state_store)
+    if not callable(getattr(conn, 'execute', None)):
+        return None
+    try:
+        selected = conn.execute(
+            """SELECT f.remote_file_id, f.path, f.size, f.fingerprint
+               FROM episode_sources s JOIN download_files f ON f.id=s.download_file_id
+               WHERE s.episode_id=? AND s.selected_primary=1 LIMIT 2""",
+            (episode_id,),
+        ).fetchall()
+    except Exception:
+        return None
+    if len(selected) != 1:
+        return None
+    result = dict(row)
+    result.update({
+        'inventory_file_id': selected[0][0],
+        'inventory_file_path': selected[0][1],
+        'inventory_file_size': selected[0][2],
+        'inventory_file_fingerprint': selected[0][3],
+    })
+    return result
+
+
+def _has_fid_cloud_parent(path: Any) -> bool:
+    return (isinstance(path, str)
+            and re.fullmatch(
+                r'fid-[0-9a-f]{64}', posixpath.basename(posixpath.dirname(path))
+            ) is not None)
+
+
+def _rename_projection_evidence(
+    old_content: bytes, new_content: bytes, row: Mapping[str, Any] | None,
+    state_store: Any,
+) -> bool:
+    """Validate either the legacy in-fid rename or a sealed flat-layout edge."""
+    if not isinstance(row, Mapping):
+        return False
+    runtime = _runtime_identity(row)
+    layout = runtime.get('_cloud_layout_intent')
+    if layout is None:
+        return _rename_projection_evidence_v1(
+            old_content, new_content, row, state_store,
+        )
+    if not isinstance(layout, Mapping):
+        return False
+    record = _layout_proof_record(row, state_store)
+    if (record is None
+            or not _valid_cloud_layout_intent(record, runtime, layout)
+            or not _cloud_layout_history_closed(
+                state_store, record, runtime, layout, 10000,
+            )):
+        return False
+    name_intent = layout.get('name_intent')
+    if (not isinstance(name_intent, Mapping)
+            or name_intent.get('from_cloud_path') == name_intent.get('to_cloud_path')
+            or posixpath.basename(str(name_intent.get('from_cloud_path') or ''))
+                == posixpath.basename(str(name_intent.get('to_cloud_path') or ''))):
+        # A same-basename move has no rename witness and cannot authorize a
+        # different published URL.
+        return False
+    return _rename_projection_evidence_v1(
+        old_content, new_content, record, state_store,
+        historical_layout=layout,
+    )
+
+
+def _rename_projection_evidence_v1(
+    old_content: bytes, new_content: bytes, row: Mapping[str, Any] | None,
+    state_store: Any, *, historical_layout: Mapping[str, Any] | None = None,
+) -> bool:
+    """Validate a v1 name witness against current or closed historical state."""
+
+    if not isinstance(row, Mapping):
+        return False
+    runtime = _runtime_identity(row)
+    intent = runtime.get("_cloud_name_intent")
+    if not isinstance(intent, Mapping):
+        return False
+    if (type(intent.get("version")) is not int or intent.get("version") != 1
+            or intent.get("rename_verified") is not True
+            or intent.get("original_status") not in {
+                EpisodeStatus.LIBRARY_READY.value, EpisodeStatus.NOTIFIED.value,
+            }):
+        return False
+    from_path, to_path = intent.get("from_cloud_path"), intent.get("to_cloud_path")
+    current_path = row.get("cloud_path")
+    if not all(isinstance(value, str) for value in (from_path, to_path, current_path)):
+        return False
+    if historical_layout is None:
+        if current_path != to_path:
+            return False
+    elif (current_path != historical_layout.get("to_cloud_path")
+          or historical_layout.get("from_cloud_path") != to_path
+          or historical_layout.get("name_intent") != intent):
+        return False
+    for value in (from_path, to_path):
+        if (not value.startswith("/") or value.startswith("//") or "\\" in value
+                or posixpath.normpath(value) != value or "?" in value or "#" in value):
+            return False
+    from_parent, to_parent = posixpath.dirname(from_path), posixpath.dirname(to_path)
+    old_name, new_name = posixpath.basename(from_path), posixpath.basename(to_path)
+    if (from_parent != to_parent or not old_name or not new_name or old_name == new_name
+            or old_name in {".", ".."} or new_name in {".", ".."}):
+        return False
+
+    file_id = intent.get("file_id")
+    if isinstance(file_id, bool) or not isinstance(file_id, (str, int)):
+        return False
+    file_id_text = str(file_id)
+    if not re.fullmatch(r"[1-9][0-9]{0,24}", file_id_text):
+        return False
+    try:
+        expected_fid_dir = _remote_file_id_token(file_id)
+    except (PathMappingError, TypeError, ValueError):
+        return False
+    if posixpath.basename(from_parent) != expected_fid_dir:
+        return False
+    directory_id = intent.get("directory_id")
+    runtime_file_id = runtime.get("remote_file_id")
+    target_directory_id = runtime.get("_target_directory_id")
+    if (isinstance(directory_id, bool) or directory_id in (None, "")
+            or isinstance(target_directory_id, bool) or target_directory_id in (None, "")
+            or (historical_layout is None
+                and str(directory_id) != str(target_directory_id))
+            or (historical_layout is not None
+                and (str(directory_id) != str(historical_layout.get("from_directory_id"))
+                     or str(target_directory_id) != str(historical_layout.get("to_directory_id"))))
+            or isinstance(runtime_file_id, bool) or str(runtime_file_id or "") != file_id_text):
+        return False
+    if row.get("file_id") not in (None, "", file_id, file_id_text):
+        return False
+    conn = getattr(state_store, "conn", state_store)
+    episode_id = row.get("id")
+    if (isinstance(episode_id, bool) or not isinstance(episode_id, int)
+            or not callable(getattr(conn, "execute", None))):
+        return False
+    try:
+        selected = conn.execute(
+            """SELECT f.remote_file_id, f.path, f.size, f.fingerprint
+               FROM episode_sources s JOIN download_files f ON f.id=s.download_file_id
+               WHERE s.episode_id=? AND s.selected_primary=1 LIMIT 2""",
+            (episode_id,),
+        ).fetchall()
+    except Exception:
+        return False
+    source_path = intent.get("source_path")
+    if (not isinstance(source_path, str) or not source_path.startswith("/")
+            or source_path.startswith("//") or "\\" in source_path
+            or posixpath.normpath(source_path) != source_path
+            or "?" in source_path or "#" in source_path):
+        return False
+    size, fingerprint = intent.get("size"), intent.get("fingerprint")
+    if (isinstance(size, bool) or not isinstance(size, int) or size <= 0
+            or not isinstance(fingerprint, (str, int)) or isinstance(fingerprint, bool)
+            or not str(fingerprint).strip()):
+        return False
+    if (len(selected) != 1 or str(selected[0][0] or "") != file_id_text
+            or selected[0][1] != source_path or _strict_positive_size(selected[0][2]) != size
+            or selected[0][3] != fingerprint):
+        return False
+    if _strict_positive_size(runtime.get("size")) != size:
+        return False
+    if runtime.get("fingerprint") != fingerprint:
+        return False
+
+    old_digest = intent.get("published_sha256_before")
+    if (not isinstance(old_digest, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", old_digest)
+            or hashlib.sha256(old_content.rstrip(b"\r\n")).hexdigest() != old_digest):
+        return False
+    old_ref = _strict_litepan_file_reference(old_content)
+    new_ref = _strict_litepan_file_reference(new_content)
+    if (old_ref is None or new_ref is None or old_ref[0] != new_ref[0]
+            or old_ref[1] != file_id_text or new_ref[1] != file_id_text
+            or old_ref[2] != old_name or new_ref[2] != new_name):
+        return False
+    return True
+
+
+def _state_database_path(state_store: Any) -> str:
+    conn = getattr(state_store, "conn", state_store)
+    if not callable(getattr(conn, "execute", None)):
+        raise ValueError("STRM rename backup state database is unavailable")
+    databases = conn.execute("PRAGMA database_list").fetchall()
+    main = [row for row in databases if len(row) >= 3 and row[1] == "main"]
+    if len(main) != 1 or not isinstance(main[0][2], str) or not main[0][2]:
+        raise ValueError("STRM rename backup state database is unavailable")
+    path = os.path.abspath(main[0][2])
+    try:
+        info = os.lstat(path)
+    except OSError as exc:
+        raise ValueError("STRM rename backup state database is unavailable") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ValueError("STRM rename backup state database is unsafe")
+    return path
+
+
+def _open_private_backup_directory(state_store: Any) -> tuple[str, int]:
+    database = _state_database_path(state_store)
+    parent = os.path.realpath(os.path.dirname(database))
+    parent_fd = os.open(parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                        | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        try:
+            os.mkdir("cloud-naming-backups", 0o700, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except FileExistsError:
+            pass
+        backup_fd = os.open(
+            "cloud-naming-backups",
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        os.fchmod(backup_fd, 0o700)
+        if (not stat.S_ISDIR(os.fstat(backup_fd).st_mode)
+                or stat.S_IMODE(os.fstat(backup_fd).st_mode) != 0o700):
+            os.close(backup_fd)
+            raise ValueError("STRM rename backup directory is unsafe")
+        os.fsync(backup_fd)
+        return parent, backup_fd
+    finally:
+        os.close(parent_fd)
+
+
+def _file_fingerprint(info: os.stat_result) -> tuple[int, ...]:
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_mode, info.st_uid, info.st_gid)
+
+
+def _read_published_strm(path: str) -> tuple[bytes, os.stat_result]:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("published STRM is not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as handle:
+            content = handle.read(65537)
+        if (len(content) > 65536
+                or _file_fingerprint(os.fstat(fd)) != _file_fingerprint(info)
+                or _file_fingerprint(os.lstat(path)) != _file_fingerprint(info)):
+            raise ValueError("published STRM changed during verification")
+        return content, info
+    finally:
+        os.close(fd)
+
+
+def _backup_and_replace_published_strm(
+    target: str, old_content: bytes, old_info: os.stat_result, temp_path: str,
+    state_store: Any,
 ) -> None:
-    """Publish a validated raw STRM under its canonical name without replace."""
+    """Privately back up the exact old artifact, then atomically replace it."""
+
+    _, backup_fd = _open_private_backup_directory(state_store)
+    backup_name = ""
+    lock_fd = -1
+    replaced = False
+    target_digest = hashlib.sha256(os.fsencode(os.path.abspath(target))).hexdigest()[:24]
+    try:
+        lock_name = f"rename-{target_digest}.lock"
+        lock_fd = os.open(
+            lock_name, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600,
+            dir_fd=backup_fd,
+        )
+        if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
+            raise ValueError("STRM rename lock is unsafe")
+        os.fchmod(lock_fd, 0o600)
+        if stat.S_IMODE(os.fstat(lock_fd).st_mode) != 0o600:
+            raise ValueError("STRM rename lock is unsafe")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ValueError("STRM rename publication is already active") from exc
+
+        # Re-open immediately before backup so a stale read cannot authorize a
+        # replacement after another writer has changed or swapped the target.
+        current, current_info = _read_published_strm(target)
+        if (_file_fingerprint(current_info) != _file_fingerprint(old_info)
+                or current != old_content):
+            raise ValueError("published STRM changed before rename replacement")
+
+        backup_name = f"cloud-strm-{target_digest}-{uuid.uuid4().hex}.bak"
+        backup_fd_file = os.open(
+            backup_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=backup_fd,
+        )
+        try:
+            with os.fdopen(backup_fd_file, "wb", closefd=False) as handle:
+                handle.write(old_content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.fchmod(backup_fd_file, 0o600)
+            if (not stat.S_ISREG(os.fstat(backup_fd_file).st_mode)
+                    or stat.S_IMODE(os.fstat(backup_fd_file).st_mode) != 0o600):
+                raise ValueError("STRM rename backup file is unsafe")
+            os.fsync(backup_fd_file)
+        finally:
+            os.close(backup_fd_file)
+        os.fsync(backup_fd)
+
+        current, current_info = _read_published_strm(target)
+        if (_file_fingerprint(current_info) != _file_fingerprint(old_info)
+                or current != old_content):
+            raise ValueError("published STRM changed before rename replacement")
+        # Keep the existing artifact's access metadata. A basename repair must
+        # not replace an Emby-readable file with a new private tempfile mode.
+        old_fd = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        temp_fd = os.open(temp_path, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            if _file_fingerprint(os.fstat(old_fd)) != _file_fingerprint(old_info):
+                raise ValueError("published STRM metadata changed before replacement")
+            temp_info = os.fstat(temp_fd)
+            if (temp_info.st_uid, temp_info.st_gid) != (old_info.st_uid, old_info.st_gid):
+                os.fchown(temp_fd, old_info.st_uid, old_info.st_gid)
+            os.fchmod(temp_fd, stat.S_IMODE(old_info.st_mode))
+            attrs = {name: os.getxattr(old_fd, name) for name in os.listxattr(old_fd)}
+            for name in os.listxattr(temp_fd):
+                if name not in attrs:
+                    os.removexattr(temp_fd, name)
+            for name, value in attrs.items():
+                os.setxattr(temp_fd, name, value)
+            if ({name: os.getxattr(temp_fd, name) for name in os.listxattr(temp_fd)} != attrs
+                    or (os.fstat(temp_fd).st_uid, os.fstat(temp_fd).st_gid,
+                        stat.S_IMODE(os.fstat(temp_fd).st_mode)) !=
+                       (old_info.st_uid, old_info.st_gid, stat.S_IMODE(old_info.st_mode))
+                    or _file_fingerprint(os.fstat(old_fd)) != _file_fingerprint(old_info)
+                    or _file_fingerprint(os.lstat(target)) != _file_fingerprint(old_info)):
+                raise ValueError("published STRM access metadata could not be preserved")
+            os.fsync(temp_fd)
+        finally:
+            os.close(temp_fd)
+            os.close(old_fd)
+        os.replace(temp_path, target)
+        replaced = True
+        target_parent = os.path.dirname(os.path.abspath(target))
+        target_fd = os.open(target_parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                            | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            os.fsync(target_fd)
+        finally:
+            os.close(target_fd)
+    except Exception:
+        if backup_name and not replaced:
+            try:
+                os.unlink(backup_name, dir_fd=backup_fd)
+                os.fsync(backup_fd)
+            except OSError:
+                pass
+        raise
+    finally:
+        if lock_fd >= 0:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            finally:
+                os.close(lock_fd)
+        os.close(backup_fd)
+
+
+def _publish_local_strm(
+    source: str, target: str, output_root: str, raw_output_root: str, *,
+    rename_row: Mapping[str, Any] | None = None, state_store: Any = None,
+) -> None:
+    """Publish a raw STRM without replace except for a proven same-file rename."""
 
     root = os.path.abspath(output_root)
     raw_root = os.path.abspath(raw_output_root)
@@ -2120,24 +2630,24 @@ def _publish_local_strm(
         try:
             os.link(temp_path, target)
         except FileExistsError:
-            target_fd = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-            try:
-                if not stat.S_ISREG(os.fstat(target_fd).st_mode):
-                    raise ValueError("published STRM is not a regular file")
-                with os.fdopen(target_fd, "rb", closefd=False) as handle:
-                    existing = handle.read(65537)
-                # A migrated v3 published STRM still carries LitePan's trailing
-                # newline, which this projection deliberately strips.  Compare
-                # the normalized existing bytes so republishing identical
-                # content stays idempotent while a genuinely different URL is
-                # still rejected (no-replace semantics preserved).
-                if existing.rstrip(b"\r\n") != content:
+            existing, existing_info = _read_published_strm(target)
+            # A migrated STRM can replace only a same-file LitePan URL whose
+            # sole change is the verified old basename to the canonical one.
+            if existing.rstrip(b"\r\n") != content:
+                evidence = _rename_projection_evidence(
+                    existing, content, rename_row, state_store,
+                )
+                if not evidence or state_store is None:
                     raise ValueError("published STRM has different content")
-            finally:
-                os.close(target_fd)
+                _backup_and_replace_published_strm(
+                    target, existing, existing_info, temp_path, state_store,
+                )
     finally:
         if temp_path:
-            os.unlink(temp_path)
+            try:
+                os.unlink(temp_path)
+            except FileNotFoundError:
+                pass
 
 
 def _runtime_config_value(value: Any, name: str) -> str:
@@ -2564,21 +3074,35 @@ def _is_video_inventory(value: Any) -> bool:
 
 
 def _safe_detail(detail: Any, secrets: Iterable[Any] = ()) -> dict[str, Any]:
-    if isinstance(detail, Mapping):
-        result: dict[str, Any] = {}
-        for key, value in detail.items():
-            if isinstance(value, Mapping):
-                result[str(key)] = _safe_detail(value, secrets)
-            elif isinstance(value, (list, tuple)):
-                result[str(key)] = [
-                    _safe_detail(item, secrets) if isinstance(item, Mapping)
-                    else sanitize_text(item, secrets=secrets)
-                    for item in value
-                ]
-            else:
-                result[str(key)] = sanitize_text(value, secrets=secrets)
-        return result
-    return {"value": sanitize_text(detail, secrets=secrets)}
+    if not isinstance(detail, Mapping):
+        return {"value": sanitize_text(detail, secrets=secrets)}
+
+    def safe(value: Any, *, in_name_intent: bool = False) -> Any:
+        if isinstance(value, Mapping):
+            return {
+                str(key): safe(
+                    item,
+                    in_name_intent=in_name_intent or key in {
+                        "_cloud_name_intent", "_cloud_layout_intent",
+                    },
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            if in_name_intent:
+                return [safe(item, in_name_intent=True) for item in value]
+            return [
+                safe(item) if isinstance(item, Mapping)
+                else sanitize_text(item, secrets=secrets)
+                for item in value
+            ]
+        if in_name_intent and (
+            value is None or type(value) in (bool, int)
+        ):
+            return value
+        return sanitize_text(value, secrets=secrets)
+
+    return safe(detail)
 
 
 def _review_reason(value: Any) -> ReviewReason:
@@ -2757,6 +3281,14 @@ def _review_projection(row: Mapping[str, Any], secrets: Iterable[Any]) -> dict[s
         "episode_id": int(episode_id) if episode_id is not None else None,
         "id": int(episode_id) if episode_id is not None else None,
         "status": sanitize_text(row.get("status") or "", secrets=secrets),
+        "media_source": sanitize_text(
+            row.get("media_source") or "", secrets=secrets,
+        ),
+        "media_id": sanitize_text(
+            row.get("media_id") or "", secrets=secrets,
+        ),
+        "season": row.get("season"),
+        "episode": row.get("episode"),
         "review_reason": reason,
         "reason": reason,
         "review_detail": detail if isinstance(detail, dict) else {},

@@ -357,6 +357,100 @@ class PathMapper:
             self.roots.cloud_library_root, isolated_relative, "cloud_library_path"
         )
 
+    def isolated_name_paths_for_episode(
+        self, episode: Mapping[str, Any] | Any, selected: Any = None
+    ) -> dict[str, str]:
+        """Return the old and canonical names inside one fid-isolated directory.
+
+        ``cloud_path`` is the durable *current* organizer path and can already
+        name a noncanonical remote file.  Strip it and the pending status before
+        deriving the canonical season route, then validate any persisted V1
+        rename intent against that independently derived target.
+        """
+
+        value = dict(_as_mapping(episode))
+        runtime = value.get("runtime_identity") or value.get("runtime_identity_json") or {}
+        if isinstance(runtime, str):
+            try:
+                runtime = json.loads(runtime)
+            except (TypeError, ValueError):
+                runtime = {}
+        if not isinstance(runtime, Mapping):
+            runtime = {}
+
+        canonical_episode = dict(value)
+        canonical_episode.pop("cloud_path", None)
+        canonical_episode["status"] = ""
+        canonical_path = self.canonical_for_episode(canonical_episode, selected)
+        from_default = self.isolated_for_episode(canonical_episode, selected)
+        parent_path = posixpath.dirname(from_default)
+        if (
+            posixpath.dirname(parent_path) != posixpath.dirname(canonical_path)
+            or _REMOTE_FILE_TOKEN.fullmatch(posixpath.basename(parent_path)) is None
+        ):
+            raise PathMappingError("cloud_name_intent: invalid isolated namespace")
+        to_path = self._join_root(
+            parent_path, posixpath.basename(canonical_path), "cloud_name_target"
+        )
+
+        intent = runtime.get("_cloud_name_intent")
+        if intent is not None:
+            if (
+                not isinstance(intent, Mapping)
+                or type(intent.get("version")) is not int
+                or intent.get("version") != 1
+            ):
+                raise PathMappingError("cloud_name_intent: unsupported version")
+            from_path = _normalize_input_path(
+                intent.get("from_cloud_path"), "cloud_name_intent.from_cloud_path"
+            )
+            persisted_to = _normalize_input_path(
+                intent.get("to_cloud_path"), "cloud_name_intent.to_cloud_path"
+            )
+            self.relative_to(from_path, self.roots.cloud_library_root, field="cloud_name_intent.from_cloud_path")
+            self.relative_to(persisted_to, self.roots.cloud_library_root, field="cloud_name_intent.to_cloud_path")
+            if posixpath.dirname(from_path) != parent_path or persisted_to != to_path:
+                raise PathMappingError("cloud_name_intent: target does not match episode identity")
+            return {"from_cloud_path": from_path, "to_cloud_path": persisted_to}
+
+        from_path = from_default
+        status = value.get("status")
+        status = getattr(status, "value", status)
+        persisted_cloud_path = value.get("cloud_path")
+        if str(status or "") == "organize_pending" and persisted_cloud_path:
+            current = _normalize_input_path(persisted_cloud_path, "cloud_path")
+            self.relative_to(current, self.roots.cloud_library_root, field="cloud_path")
+            if posixpath.dirname(current) != parent_path:
+                raise PathMappingError("cloud_path: pending target left its fid-isolated directory")
+            from_path = current
+        return {"from_cloud_path": from_path, "to_cloud_path": to_path}
+
+    def flat_for_episode(self, episode: Mapping[str, Any] | Any, selected: Any = None) -> str:
+        """Derive the canonical final video directly under its Season directory."""
+        value = dict(_as_mapping(episode))
+        value.pop("cloud_path", None)
+        value["status"] = ""
+        return self.canonical_for_episode(value, selected)
+
+    def layout_archive_root_for_episode(
+        self, episode: Mapping[str, Any] | Any, selected: Any = None,
+    ) -> str:
+        """Keep empty staging folders outside every final Season directory."""
+        final_path = self.flat_for_episode(episode, selected)
+        relative = self.relative_to(final_path, self.roots.cloud_library_root,
+                                    field="flat_cloud_path")
+        quarter = relative.split("/", 1)[0]
+        if re.fullmatch(r"[0-9]{4}-(01|04|07|10)月新番", quarter) is None:
+            raise PathMappingError("flat_cloud_path: missing verified quarter")
+        return posixpath.join(self.roots.cloud_library_root, quarter, ".pipeline-staging")
+
+    def named_isolated_for_episode(
+        self, episode: Mapping[str, Any] | Any, selected: Any = None
+    ) -> str:
+        """Build or recover the canonical basename target below ``fid-*``."""
+
+        return self.isolated_name_paths_for_episode(episode, selected)["to_cloud_path"]
+
     # Common spellings used by stage services and focused tests.  Keeping the
     # aliases here avoids letting each service reimplement path concatenation.
     canonical_cloud_path = build_canonical_cloud_path

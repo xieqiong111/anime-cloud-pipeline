@@ -454,12 +454,6 @@ class HermesDispatchTests(unittest.TestCase):
                 ["dry-run", "--previous-day"],
                 prefix + ["dry-run"] + config + ["--previous-day"],
             ),
-            (["qualify"], prefix + ["qualify"] + config),
-            (["plan-resources"], prefix + ["plan-resources"] + config),
-            (
-                ["prepare-resources", "--apply"],
-                prefix + ["prepare-resources"] + config + ["--apply"],
-            ),
             (
                 ["run", "--resume-only"],
                 prefix + ["run"] + config + ["--resume-only"],
@@ -512,9 +506,6 @@ class HermesDispatchTests(unittest.TestCase):
             ["preflight"],
             ["migrate"],
             ["dry-run"],
-            ["qualify"],
-            ["plan-resources"],
-            ["prepare-resources", "--apply"],
             ["run"],
             ["status"],
             ["reviews", "list"],
@@ -877,13 +868,7 @@ class DeploymentExampleTests(unittest.TestCase):
         for service in services.values():
             if "base_url" in service:
                 self.assertIn(".example.invalid", service["base_url"])
-        for key, value in raw["paths"].items():
-            if key in {"cloud_library_subdir", "litepan_publish_subdir"}:
-                self.assertTrue(value)
-                self.assertNotIn("/", value)
-                self.assertNotIn("\\", value)
-                self.assertNotIn(value, (".", ".."))
-                continue
+        for value in raw["paths"].values():
             self.assertTrue(value.startswith("/<"), value)
         self.assertTrue(services["cloud"]["root_directory_path"].startswith("/<"))
 
@@ -972,120 +957,6 @@ class HermesMainTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "")
             self.assertEqual(stderr.getvalue(), "")
             self.assertFalse(Path(tmp, "should-not-exist").exists())
-
-    def test_resource_apply_passes_only_valid_one_shot_process_authorization(self):
-        revision = "a" * 64
-        with prepared_doctor_layout() as layout:
-            caller = {
-                "OCTOP_PIPELINE_ALLOW_RESOURCES": "1",
-                "OCTOP_PIPELINE_RESOURCE_REVISION": revision,
-                "UNRELATED": "must-not-pass",
-            }
-            before = dict(caller)
-            with mock.patch.object(
-                hermes_runtime, "resolve_layout", return_value=layout
-            ), mock.patch.object(hermes_runtime.os, "execve") as execve:
-                code = main(["prepare-resources", "--apply"], environ=caller)
-
-            self.assertEqual(code, 0)
-            self.assertEqual(caller, before)
-            execve.assert_called_once()
-            _, command, child_environment = execve.call_args.args
-            self.assertEqual(command[3], "prepare-resources")
-            self.assertEqual(child_environment["OCTOP_PIPELINE_ALLOW_RESOURCES"], "1")
-            self.assertEqual(
-                child_environment["OCTOP_PIPELINE_RESOURCE_REVISION"], revision
-            )
-            self.assertNotIn("UNRELATED", child_environment)
-
-    def test_resource_authorization_is_dropped_for_read_only_or_non_apply_commands(self):
-        caller = {
-            "OCTOP_PIPELINE_ALLOW_RESOURCES": "1",
-            "OCTOP_PIPELINE_RESOURCE_REVISION": "b" * 64,
-        }
-        cases = (
-            ["qualify"],
-            ["plan-resources"],
-            ["prepare-resources"],
-        )
-        with prepared_doctor_layout() as layout:
-            for arguments in cases:
-                with self.subTest(arguments=arguments):
-                    with mock.patch.object(
-                        hermes_runtime, "resolve_layout", return_value=layout
-                    ), mock.patch.object(hermes_runtime.os, "execve") as execve:
-                        code = main(arguments, environ=caller)
-
-                    self.assertEqual(code, 0)
-                    execve.assert_called_once()
-                    child_environment = execve.call_args.args[2]
-                    self.assertNotIn(
-                        "OCTOP_PIPELINE_ALLOW_RESOURCES", child_environment
-                    )
-                    self.assertNotIn(
-                        "OCTOP_PIPELINE_RESOURCE_REVISION", child_environment
-                    )
-
-    def test_resource_apply_does_not_accept_authorization_from_persistent_env_file(self):
-        with prepared_doctor_layout(
-            env={
-                "OCTOP_PIPELINE_ALLOW_RESOURCES": "1",
-                "OCTOP_PIPELINE_RESOURCE_REVISION": "c" * 64,
-            }
-        ) as layout:
-            stderr = io.StringIO()
-            with mock.patch.object(
-                hermes_runtime, "resolve_layout", return_value=layout
-            ), mock.patch.object(hermes_runtime.os, "execve") as execve:
-                with redirect_stderr(stderr):
-                    code = main(["prepare-resources", "--apply"], environ={})
-
-            self.assertEqual(code, 2)
-            execve.assert_not_called()
-            self.assertIn("unsupported environment variable", stderr.getvalue())
-
-    def test_resource_apply_drops_invalid_one_shot_authorization(self):
-        caller = {
-            "OCTOP_PIPELINE_ALLOW_RESOURCES": "1",
-            "OCTOP_PIPELINE_RESOURCE_REVISION": "D" * 64,
-        }
-        with prepared_doctor_layout() as layout:
-            with mock.patch.object(
-                hermes_runtime, "resolve_layout", return_value=layout
-            ), mock.patch.object(hermes_runtime.os, "execve") as execve:
-                code = main(["prepare-resources", "--apply"], environ=caller)
-
-            self.assertEqual(code, 0)
-            execve.assert_called_once()
-            child_environment = execve.call_args.args[2]
-            self.assertNotIn("OCTOP_PIPELINE_ALLOW_RESOURCES", child_environment)
-            self.assertNotIn("OCTOP_PIPELINE_RESOURCE_REVISION", child_environment)
-
-    def test_resource_authorization_names_cannot_be_configured_as_service_secrets(self):
-        with prepared_doctor_layout() as layout:
-            raw = json.loads(layout.config_path.read_text(encoding="utf-8"))
-            raw["services"]["moviepilot"]["token_env"] = (
-                "OCTOP_PIPELINE_ALLOW_RESOURCES"
-            )
-            layout.config_path.write_text(
-                json.dumps(raw), encoding="utf-8"
-            )
-            stderr = io.StringIO()
-            with mock.patch.object(
-                hermes_runtime, "resolve_layout", return_value=layout
-            ), mock.patch.object(hermes_runtime.os, "execve") as execve:
-                with redirect_stderr(stderr):
-                    code = main(
-                        ["prepare-resources", "--apply"],
-                        environ={
-                            "OCTOP_PIPELINE_ALLOW_RESOURCES": "1",
-                            "OCTOP_PIPELINE_RESOURCE_REVISION": "d" * 64,
-                        },
-                    )
-
-            self.assertEqual(code, 2)
-            execve.assert_not_called()
-            self.assertIn("reserved resource authorization", stderr.getvalue())
 
     def test_main_passes_only_fixed_and_configured_environment_names(self):
         with tempfile.TemporaryDirectory() as tmp:

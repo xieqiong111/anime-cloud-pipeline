@@ -7,8 +7,8 @@ from pipeline.models import Subscription
 from pipeline.parsers import SourceItem
 
 
-SUB = Subscription("sub-1", "tmdb", "12345", "Show", season=1, season_air_date="2026-10-03")
-WINDOW = {"season_quarter": "2026-10", "backfill": {"media_id": "12345", "season": 1, "start": 4, "end": 4}}
+SUB = Subscription("sub-1", "tmdb", "311842", "Show", season=1, season_air_date="2026-10-03")
+WINDOW = {"season_quarter": "2026-10", "backfill": {"media_id": "311842", "season": 1, "start": 4, "end": 4}}
 
 
 def rss(title="Show - 04 [1080p]", **kwargs):
@@ -20,13 +20,13 @@ class RssBackfillWindowTests(unittest.TestCase):
         item = rss()
         self.assertTrue(source_result_in_window(SUB, item, WINDOW))
         decision = DiscoveryService(None, None, [])._normalize_decision(SUB, item, "rss")
-        self.assertEqual((decision.media_id, decision.season, decision.episode, decision.decision), ("12345", 1, 4, "candidate"))
+        self.assertEqual((decision.media_id, decision.season, decision.episode, decision.decision), ("311842", 1, 4, "candidate"))
         self.assertEqual(item.raw, {})
         self.assertIsNone(item.season)
 
     def test_tmdb_aliases_are_equivalent(self):
         for source in ("tmdb", "themoviedb"):
-            self.assertTrue(source_result_in_window(replace(SUB, media_source=source), rss(raw={"media_source": "themoviedb", "media_id": "12345"}), WINDOW))
+            self.assertTrue(source_result_in_window(replace(SUB, media_source=source), rss(raw={"media_source": "themoviedb", "media_id": "311842"}), WINDOW))
 
     def test_subscription_must_match_target_work_source_and_season(self):
         for sub in (replace(SUB, media_id="999"), replace(SUB, media_source="legacy"), replace(SUB, media_source="other"), replace(SUB, season=2), replace(SUB, season=None)):
@@ -34,7 +34,7 @@ class RssBackfillWindowTests(unittest.TestCase):
                 self.assertFalse(source_result_in_window(sub, rss(), WINDOW))
 
     def test_explicit_identity_conflicts_are_rejected(self):
-        for raw in ({"media_id": "999"}, {"tmdb_id": "999"}, {"media_id": "12345", "tmdb_id": "999"}, {"media_source": "other"}, {"season": 2}, {"episode": 3}, {"episode_end": 0}, {"season": 1.2}, {"episode": True}):
+        for raw in ({"media_id": "999"}, {"tmdb_id": "999"}, {"media_id": "311842", "tmdb_id": "999"}, {"media_source": "other"}, {"season": 2}, {"episode": 3}, {"episode_end": 0}, {"season": 1.2}, {"episode": True}):
             with self.subTest(raw=raw):
                 self.assertFalse(source_result_in_window(SUB, rss(raw=raw), WINDOW))
         self.assertFalse(source_result_in_window(SUB, rss("Show S02E04"), WINDOW))

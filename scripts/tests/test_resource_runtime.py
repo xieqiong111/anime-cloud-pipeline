@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -59,9 +60,7 @@ class ResourceRuntimeTests(unittest.TestCase):
             patch.object(runtime, "_current_quarter", return_value="2026-10"),
             patch.dict(os.environ, {
                 "OCTOP_PIPELINE_ALLOW_RESOURCES": "1",
-                "OCTOP_PIPELINE_RESOURCE_REVISION": runtime._resource_plan_revision(
-                    self.original, self.layout["quarter"]
-                ),
+                "OCTOP_PIPELINE_RESOURCE_REVISION": hashlib.sha256(self.original).hexdigest(),
             }),
         ]
         for context in self.contexts:
@@ -103,78 +102,12 @@ class ResourceRuntimeTests(unittest.TestCase):
         original = self.path.stat()
         report = self.run_command(apply=False)
         self.assertEqual(report["status"], "plan_only")
-        self.assertEqual(
-            report["config_revision"],
-            runtime._resource_plan_revision(self.original, self.layout["quarter"]),
-        )
-        self.assertRegex(report["config_revision"], r"^[0-9a-f]{64}$")
+        self.assertEqual(report["config_revision"], hashlib.sha256(self.original).hexdigest())
         self.assertEqual(len(report["config_changes"]), 7)
         self.assertEqual(self.files(), before)
         self.assertEqual(self.path.stat().st_ino, original.st_ino)
         self.ports.create.assert_not_called()
         self.ports.config_patch.assert_not_called()
-
-    def test_same_config_plans_for_different_quarters_have_different_revisions(self):
-        october = self.run_command(apply=False)
-        january_layout = {**self.layout, "quarter": "2027-01"}
-        self.builder.return_value = january_layout
-
-        with patch.object(runtime, "_current_quarter", return_value="2027-01"):
-            january = self.run_command(apply=False)
-
-        self.assertEqual(october["status"], "plan_only")
-        self.assertEqual(january["status"], "plan_only")
-        self.assertEqual(self.original, self.path.read_bytes())
-        self.assertNotEqual(october["config_revision"], january["config_revision"])
-        self.assertEqual(
-            october["config_revision"],
-            runtime._resource_plan_revision(self.original, "2026-10"),
-        )
-        self.assertEqual(
-            january["config_revision"],
-            runtime._resource_plan_revision(self.original, "2027-01"),
-        )
-
-    def test_previous_quarter_revision_blocks_before_ports_or_writes(self):
-        october = self.run_command(apply=False)
-        self.constructor.reset_mock()
-        self.ports.reset_mock()
-        january_layout = {**self.layout, "quarter": "2027-01"}
-        self.builder.return_value = january_layout
-        before = self.files()
-
-        with patch.object(runtime, "_current_quarter", return_value="2027-01"):
-            report = self.run_command()
-
-        self.assertEqual(report["reason"], "resource_plan_stale")
-        self.constructor.assert_not_called()
-        self.ports.inventory.assert_not_called()
-        self.ports.create.assert_not_called()
-        self.ports.config_patch.assert_not_called()
-        self.assertEqual(self.path.read_bytes(), self.original)
-        self.assertEqual(self.files(), before)
-        self.assertFalse((self.state / "run.lock").exists())
-        self.assertFalse((self.state / "resource-preparation.jsonl").exists())
-        self.assertFalse((self.root / "backups").exists())
-        self.assertNotEqual(
-            october["config_revision"],
-            runtime._resource_plan_revision(self.original, january_layout["quarter"]),
-        )
-
-    def test_same_quarter_fresh_plan_revision_allows_normal_apply(self):
-        plan = self.run_command(apply=False)
-        self.constructor.reset_mock()
-        with patch.dict(
-            os.environ,
-            {"OCTOP_PIPELINE_RESOURCE_REVISION": plan["config_revision"]},
-        ):
-            report = self.run_command()
-
-        self.assertEqual(report["status"], "prepared")
-        self.assertEqual(report["config_revision"], plan["config_revision"])
-        self.constructor.assert_called_once()
-        self.ports.create.assert_not_called()
-        self.assertTrue((self.state / "resource-preparation.jsonl").exists())
 
     def test_missing_or_invalid_revision_blocks_before_lock_ports_or_writes(self):
         before = self.files()

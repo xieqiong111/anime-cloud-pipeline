@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import types
@@ -12,6 +13,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -212,6 +214,103 @@ class ResourceCliTests(unittest.TestCase):
         self.assertIn("dry-run", parser._subparsers._group_actions[0].choices)
         self.assertIn("preflight", parser._subparsers._group_actions[0].choices)
 
+
+class WrapperAllowlistTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="v5-wrapper-")
+        self.root = Path(self.tmp.name)
+        self.bin_dir = self.root / "bin"
+        self.bin_dir.mkdir()
+        self.ssh_calls = self.root / "ssh-calls.txt"
+        ssh = self.bin_dir / "ssh"
+        ssh.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$SSH_CALL_LOG\"\n"
+            "printf '%s\\n' \"$@\"\n",
+            encoding="utf-8",
+        )
+        ssh.chmod(0o755)
+        self.env = dict(os.environ)
+        self.env["PATH"] = str(self.bin_dir) + os.pathsep + self.env.get("PATH", "")
+        self.env["SSH_CALL_LOG"] = str(self.ssh_calls)
+        self.env.pop("OCTOP_PIPELINE_ALLOW_RESOURCES", None)
+        self.env.pop("OCTOP_PIPELINE_ALLOW_WRITE", None)
+        self.env.pop("OCTOP_PIPELINE_RESOURCE_REVISION", None)
+        self.wrapper = PROJECT_ROOT / "candidate" / "octop-nas-v5.sh"
+        if not self.wrapper.exists():
+            self.skipTest("deployment wrapper is not part of the public tree")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_wrapper(self, *argv, env=None):
+        return subprocess.run(
+            ["sh", str(self.wrapper), *argv],
+            text=True,
+            capture_output=True,
+            env=env or self.env,
+            check=False,
+        )
+
+    def test_read_only_commands_are_allowlisted_without_resource_auth_injection(self):
+        env = dict(self.env)
+        env["OCTOP_PIPELINE_ALLOW_RESOURCES"] = "1"
+        env["PRIVATE_TOKEN"] = "never-forward-this"
+        for command in (("qualify",), ("plan-resources",)):
+            with self.subTest(command=command):
+                result = self.run_wrapper(*command, env=env)
+                remote = result.stdout.splitlines()[-1]
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("V5_ANIME_GUARD=1 python3.12 bin/run_v5.py", remote)
+                self.assertIn("--config config/config.v5.json", remote)
+                self.assertNotIn("OCTOP_PIPELINE_ALLOW_RESOURCES=1", remote)
+                self.assertNotIn("never-forward-this", result.stdout + result.stderr)
+
+    def test_prepare_requires_local_resource_authorization_and_injects_only_fixed_value(self):
+        denied = self.run_wrapper("prepare-resources", "--apply")
+        self.assertEqual(denied.returncode, 2)
+        self.assertIn("OCTOP_PIPELINE_ALLOW_RESOURCES=1", denied.stderr)
+        self.assertFalse(self.ssh_calls.exists())
+
+        env = dict(self.env)
+        env["OCTOP_PIPELINE_ALLOW_RESOURCES"] = "1"
+        env["PRIVATE_TOKEN"] = "never-forward-this"
+        env["OCTOP_PIPELINE_RESOURCE_REVISION"] = "a" * 64
+        allowed = self.run_wrapper("prepare-resources", "--apply", env=env)
+        remote = allowed.stdout.splitlines()[-1]
+        self.assertEqual(allowed.returncode, 0)
+        self.assertIn(
+            "V5_ANIME_GUARD=1 OCTOP_PIPELINE_ALLOW_RESOURCES=1 OCTOP_PIPELINE_RESOURCE_REVISION=" + "a" * 64 + " python3.12",
+            remote,
+        )
+        self.assertIn("prepare-resources --apply --config config/config.v5.json", remote)
+        self.assertNotIn("never-forward-this", allowed.stdout + allowed.stderr)
+        self.assertNotIn("OCTOP_PIPELINE_ALLOW_WRITE=1", remote)
+
+    def test_prepare_rejects_missing_or_unsafe_revision_before_ssh(self):
+        env = dict(self.env)
+        env["OCTOP_PIPELINE_ALLOW_RESOURCES"] = "1"
+        for revision in ("", "A" * 64, "a" * 63, "a" * 65, "a" * 64 + "; touch /tmp/unsafe"):
+            env["OCTOP_PIPELINE_RESOURCE_REVISION"] = revision
+            result = self.run_wrapper("prepare-resources", "--apply", env=env)
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse(self.ssh_calls.exists())
+
+    def test_old_run_authorization_and_exact_argument_allowlist_are_preserved(self):
+        denied = self.run_wrapper("run", "--resume-only")
+        self.assertEqual(denied.returncode, 2)
+        self.assertIn("OCTOP_PIPELINE_ALLOW_WRITE=1", denied.stderr)
+
+        env = dict(self.env)
+        env["OCTOP_PIPELINE_ALLOW_WRITE"] = "1"
+        run = self.run_wrapper("run", "--resume-only", env=env)
+        remote = run.stdout.splitlines()[-1]
+        self.assertEqual(run.returncode, 0)
+        self.assertIn("run --resume-only --config config/config.v5.json", remote)
+        self.assertNotIn("OCTOP_PIPELINE_ALLOW_RESOURCES=1", remote)
+
+        extra = self.run_wrapper("prepare-resources", "--apply", "--config", "private.json")
+        self.assertEqual(extra.returncode, 2)
+        self.assertIn("not in bounded V5 operation allowlist", extra.stderr)
 
 
 if __name__ == "__main__":
