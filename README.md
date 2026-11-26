@@ -1,47 +1,48 @@
 # Anime Cloud Pipeline V5
 
-面向 Linux NAS 的动漫云媒体自动化流水线：以 MoviePilot 订阅作为发现来源，
-将下载任务提交到 115 云盘，通过 LitePan 生成 STRM，补充媒体元数据，最后刷新
-Emby 媒体库。支持 Hermes 部署和 NAS 原生 agent 调用；每个实例保留已经核实的
-唯一生产调度所有者。
+面向 Linux NAS 的动漫云媒体自动化流水线：以 **MoviePilot** 订阅为发现来源，经 **115 云盘** 下载与 Season 平铺整理、**LitePan** 生成 STRM、补充本地侧车元数据与剧照，最终刷新 **Emby** 媒体库完成入库。支持 **Hermes 不可变 Release 部署** 与 **独立 V5 / Agent Skill 运行**，每个实例保留唯一生产调度所有者。
 
-> 当前仓库提供可复现构建、不可变 release 安装、原子激活与回滚、只读诊断、
-> 状态审计和人工 review 流程。限定五集的补全至 Emby 入库已在授权 NAS 上验证，
-> 其中四集各新增提交一次、原有一集未重复提交。实际播放、订阅自动触发及其他
-> 部署的挂载、凭据和服务版本仍须单独验收。
+> 本仓库提供可复现打包、只读上线门禁、状态机与事务审计、季度资源规划、云盘平铺整理及隔离回归测试。真实凭据、NAS 配置、SQLite 状态库与运维脚本均保留在仓库外部。
 
-## 核心能力
+---
 
-- 单次有界执行：每次 `run` 处理一个快照，每集最多推进一个外部阶段。
-- 订阅自动补集：普通运行查询当前季度合格订阅的已播集，逐集搜索 RSS 未覆盖的历史资源；实际下载仍须完整库存明确确认缺失。
-- SQLite 持久状态：可恢复、可审计，不把“任务已接受”误判为“媒体已完成”。
-- 人工复核：不确定的远程状态进入 `needs_review`，按原因提交结构化处理结果。
-- 库存归属证明：区分 STRM、集级元数据和剧季共享图片；未知或冲突仍阻止提交。
-- 人工候选选择恢复：已解决的 review 仍通过当前资格检查时保留所选候选。
-- 安全发布：确定性 ZIP、SHA-256 manifest、不可变 release、`current`/`previous` 原子切换。
-- 安全配置：凭据只通过受限环境文件注入，不写入 JSON、日志、报告或 Git。
-- 单一调度所有权：沿用实例已有的 NAS cron 或原生 agent 任务，不新增第二份调度或进程内睡眠循环。
-- 只读上线门禁：`doctor`、`preflight`、`migrate --check-only` 和 `dry-run` 在写入前执行。
-- 季度资源准备：先独立核实订阅资格，再盘点和复用资源，仅在授权模式内创建确证缺失的季度资源。
-- 严格提交回执：标准磁链 SSP 接口校验成功标志和同一 hash，提交前持久化次数与意图，结果未知时停止自动重提。
+## 核心特性
 
-自动补集的验证边界：既有只读验收 `history_queries=0`，尚未验证 RSS 之外的历史
-搜索路径；专门自动补集测试为 `NOT_RUN`。本次各 188 项定向库存与选择等回归
-不证明自动补集全路径覆盖，订阅自动触发也仍待单独验收。
+- **当前季度资格与范围隔离**
+  - 通过 `qualify` 严格校验 MoviePilot 订阅：限定授权来源（`admin` / `Bangumi订阅`）、Anime 类型（`genre 16`）以及对应季度首播日期。
+  - 通过 `scope-check` 将当前季度可运行身份与范围外历史 `needs_review` 隔离（`outside_declared_scope` 原样保留、不跨季推断或推进）。
+- **订阅自动补集与有界快照推进**
+  - 普通 `run` 与 `dry-run` 同步核查当前季度合格订阅的已播单集日历，对常规 RSS 未覆盖的已播集按查询预算与游标补搜历史来源。
+  - 每次 `run` / `run --resume-only` 仅推进一个有界快照；新提交下载后优先收尾核验已有任务与下游状态，不以“提交成功”代替入库完成。
+- **115 云盘 Season 平铺结构与自净**
+  - 新下载先在临时 `fid-*` 目录内隔离改名并校验文件 ID、大小与指纹，再以单写者事务移动为 **`作品/Season N/作品 - S01E01.ext`**（视频直接放在 `Season N` 下）。
+  - 移动并回读整季清单后，原地删除已核验为空的 `fid-*` 暂存目录（`staging_archive_state: "deleted"`）及空源下载目录。
+- **LitePan STRM 双根分离与全量库存证明**
+  - 分离 `raw` 与 `published` STRM 根目录并校验内容一致；严格区分媒体文件、STRM、集级 NFO/剧照与剧季共享图片，库存清单不完整或归属冲突时自动阻断提交。
+- **侧车容错与首播次日剧照补全**
+  - 刚开播剧集若仅缺单集剧照（`<stem>.jpg`）而 NFO 与其余侧车齐备，允许以 `complete_without_episode_image` 完成入库。
+  - 每次 `run` 结束后自动为**首播日期早于当天**的已入库集从 TMDB 补齐缺失剧照（不覆盖已有图片，单轮有上限且失败隔离不影响主流程）。
+- **季度资源规划与中文化 Emby 展示名**
+  - `plan-resources` 只读盘点 8 项季度资源（云盘季度/源/整理目录、本地 raw/published 目录、LitePan 任务与 Webhook 规则、Emby 媒体库）并生成绑定配置与季度的 64 位 `config_revision`。
+  - Emby 库显示名自动映射为中文季度名（**一月新番 / 四月新番 / 七月新番 / 十月新番**），云端与磁盘目录保持 `YYYY-MM月新番` 年份前缀；仅在显式双变量授权下执行 `prepare-resources --apply`。
+- **事务审计与人工复核**
+  - SQLite 持久化单集状态与阶段历史；异常或不确定远程状态进入 `needs_review`，须按原因与 `generation` 做 CAS 核销。
 
-## 流程概览
+---
+
+## 流程与状态机
 
 ```text
-MoviePilot subscription
+MoviePilot 订阅发现与季度筛选
         ↓
-discover → select → submit to 115 → reconcile cloud files
+  选源与库存核验 → 提交 115 磁链并校验回执 → 云盘文件对账
         ↓
-organize → LitePan STRM → metadata → Emby refresh → notify
+  115 Season 平铺整理（fid-* 改名 → 移入 Season N → 删除空暂存/源目录）
         ↓
-SQLite state / audit / needs_review
+  LitePan STRM 生成 → 侧车刮削（次日 TMDB 补剧照）→ Emby 精确身份路径入库
 ```
 
-主要状态：
+核心状态流转：
 
 ```text
 discovered → download_pending → submitted → cloud_ready
@@ -49,162 +50,124 @@ discovered → download_pending → submitted → cloud_ready
 → scrape_pending → metadata_ready → library_pending → library_ready → notified
 ```
 
-## 运行要求
+---
 
-- Linux NAS，支持 POSIX `sh`
-- Python 3.12 或更高版本
-- SQLite 支持
-- 可写的配置、状态、日志和备份目录
-- MoviePilot、115、LitePan 与 Emby 的授权配置
+## 运行环境要求
 
-release 代码由部署账号管理；运行服务账号仅拥有可变目录。不要对整个安装根目录
-执行递归 `chown`，否则会破坏 release 与运行账号之间的权限边界。
+- Linux NAS（支持 POSIX `sh`）
+- Python **3.12** 或更高版本
+- SQLite
+- 可用的 MoviePilot、115、LitePan 与 Emby 服务及授权配置
 
-## 快速开始
+> 在 Hermes 部署模式下，代码 release 目录由部署账号拥有，运行账号仅拥有状态、日志与备份等可变目录；请勿对安装根目录递归执行 `chown`。
 
-以下命令中的 `<...>` 是语义占位符，执行前必须替换为目标环境中的值；不要复制
-开发机或其他 NAS 的路径。
+---
 
-### 1. 构建可验证的交付包
+## 快速开始（Hermes Release 部署）
 
-```sh
-python3 deploy/hermes_release.py build \
-  --source . \
-  --output "<artifact-output>/anime-cloud-pipeline-hermes.zip" \
-  --release-id "<release-id>" \
-  --source-revision "<source-revision>"
-```
+以下 `<...>` 为占位符，执行前请替换为目标环境实际值：
 
-交付包只包含允许发布的源码、脚本、示例配置和文档，不包含真实配置、环境文件、
-数据库、日志、缓存或 Git 元数据。
+1. **构建可校验交付包**
+   ```sh
+   python3 deploy/hermes_release.py build \
+     --source . \
+     --output "<artifact-output>/anime-cloud-pipeline-hermes.zip" \
+     --release-id "<release-id>" \
+     --source-revision "<source-revision>"
+   ```
+2. **解压并校验 SHA-256 清单**
+   ```sh
+   unzip -q "<release-archive>.zip" -d "<artifact-staging-root>"
+   cd "<artifact-staging-root>/anime-cloud-pipeline-hermes"
+   sha256sum -c MANIFEST.sha256
+   ```
+3. **准备外部配置与受限环境文件（`0600`）**
+   ```sh
+   cp deploy/config.v5.example.json "<config-path>"
+   cp deploy/anime-cloud-pipeline.env.example "<env-file>"
+   chmod 600 "<env-file>"
+   ```
+4. **安装并执行只读门禁**
+   ```sh
+   sh deploy/install.sh \
+     --source . \
+     --install-root "<install-root>" \
+     --config "<config-path>" \
+     --env-file "<env-file>" \
+     --release-id "<release-id>"
 
-### 2. 解压并验证
+   "<install-root>/releases/<release-id>/bin/anime-cloud-pipeline" doctor
+   "<install-root>/releases/<release-id>/bin/anime-cloud-pipeline" preflight
+   "<install-root>/releases/<release-id>/bin/anime-cloud-pipeline" migrate --check-only
+   "<install-root>/releases/<release-id>/bin/anime-cloud-pipeline" dry-run
+   ```
 
-```sh
-unzip -q "<release-archive>.zip" -d "<artifact-staging-root>"
-cd "<artifact-staging-root>/anime-cloud-pipeline-hermes"
-sha256sum -c MANIFEST.sha256
-```
+完整部署、激活与回滚说明见 [Hermes NAS 部署手册](references/deployment-hermes.md) 与 [V5 升级指南](docs/V5-UPGRADE.md)；独立原生部署可使用 `scripts/v5_bootstrap.py` 与 `scripts/run_pipeline.py`（见 [Skill 操作契约](SKILL.md)）。
 
-### 3. 准备外部配置
-
-将示例复制到安装根目录的 `config/`，再替换语义占位符。凭据只写入权限为
-`0600` 或更严格的环境文件，禁止提交到仓库。
-
-```sh
-cp deploy/config.v5.example.json "<config-path>"
-cp deploy/anime-cloud-pipeline.env.example "<env-file>"
-chmod 600 "<env-file>"
-```
-
-### 4. 安装但不激活
-
-```sh
-sh deploy/install.sh \
-  --source . \
-  --install-root "<install-root>" \
-  --config "<config-path>" \
-  --env-file "<env-file>" \
-  --release-id "<release-id>"
-```
-
-### 5. 执行只读门禁
-
-```sh
-"<install-root>/releases/<release-id>/bin/anime-cloud-pipeline" doctor
-"<install-root>/releases/<release-id>/bin/anime-cloud-pipeline" preflight
-"<install-root>/releases/<release-id>/bin/anime-cloud-pipeline" migrate --check-only
-"<install-root>/releases/<release-id>/bin/anime-cloud-pipeline" dry-run
-```
-
-通过门禁后，再按照完整部署手册执行显式激活、独立数据库迁移、单条媒体验收和
-NAS cron 替换。不要把 HTTP 200、下载任务已提交、单个 STRM 文件存在或媒体库
-刷新请求已接受当作端到端完成证据。
-
-完整步骤见 [Hermes NAS 部署手册](references/deployment-hermes.md)。
+---
 
 ## 常用命令
 
-安装后统一使用稳定入口：
-
 ```text
-<install-root>/current/bin/anime-cloud-pipeline version
-<install-root>/current/bin/anime-cloud-pipeline doctor
-<install-root>/current/bin/anime-cloud-pipeline preflight
-<install-root>/current/bin/anime-cloud-pipeline qualify
-<install-root>/current/bin/anime-cloud-pipeline plan-resources
-<install-root>/current/bin/anime-cloud-pipeline migrate --check-only
-<install-root>/current/bin/anime-cloud-pipeline dry-run
-<install-root>/current/bin/anime-cloud-pipeline run
-<install-root>/current/bin/anime-cloud-pipeline status
-<install-root>/current/bin/anime-cloud-pipeline reviews list
-<install-root>/current/bin/anime-cloud-pipeline audit
+# 只读诊断与预览
+anime-cloud-pipeline preflight
+anime-cloud-pipeline migrate --check-only
+anime-cloud-pipeline qualify
+anime-cloud-pipeline scope-check
+anime-cloud-pipeline plan-resources
+anime-cloud-pipeline dry-run [--details]
+anime-cloud-pipeline status
+anime-cloud-pipeline reviews list
+anime-cloud-pipeline audit
+anime-cloud-pipeline cloud-layout
+anime-cloud-pipeline cloud-names
+
+# 写入操作（须取得对应授权）
+anime-cloud-pipeline run
+anime-cloud-pipeline run --resume-only
+anime-cloud-pipeline reviews resolve --id <id> --generation <gen> --resolution '<json>'
 ```
 
-`run`、正式 `migrate`、`reviews resolve`、激活、回滚和 cron 修改均可能写入本地
-状态或调用外部服务，需要明确授权。
-
-季度资源准备使用独立授权，不会自动启动下载、STRM、刮削或入库。先运行
-`qualify`；有合格订阅时运行 `plan-resources`，审阅资源、映射和返回的
-`config_revision`，再在本次已授权调用中执行：
+**季度资源授权制备**（独立授权，不会自动触发下载或入库）：
 
 ```sh
 OCTOP_PIPELINE_ALLOW_RESOURCES=1 \
-OCTOP_PIPELINE_RESOURCE_REVISION="<fresh-plan-config_revision>" \
+OCTOP_PIPELINE_RESOURCE_REVISION="<plan-resources-config_revision>" \
 "<install-root>/current/bin/anime-cloud-pipeline" prepare-resources --apply
 ```
 
-两个授权变量只用于该次命令，不写入持久环境文件。完成后重新运行 preflight 和
-dry-run；仅媒体本身也已获得授权时，才继续限定范围的 `run`。资源实现当前按
-Asia/Shanghai 推导季度，配置使用其他时区时须先完成兼容性审查。
-完整资源和管理会话要求见[季度资源契约](references/quarter-resources.md)。
+---
 
-NAS 原生 agent 也可调用同一 Python CLI 和 Skill；保持该实例已有且核实的唯一
-调度所有者。不要因本仓库提供 NAS cron 示例而给已有 agent 定时任务新增第二份调度。
-本仓库不包含某台 NAS 的 SSH 包装器、私有启动器、配置或审批记录。
-
-## 本地验证
+## 本地测试
 
 ```sh
-python3 -m compileall -q scripts deploy
-python3 -m unittest discover -s scripts -p 'test*.py'
+python3.12 -m compileall -q scripts deploy
+PYTHONPATH=scripts python3.12 -m unittest discover -s scripts/tests -p 'test*.py'
 ```
 
-Windows 上的测试不能证明 POSIX 所有权、符号链接、ACL、cron 或 NAS 挂载行为；
-这些项目必须在目标 Linux NAS 上验证。
+> POSIX 权限、符号链接、ACL、NAS 挂载及定时任务行为须在目标 Linux NAS 上实测验证。
 
-## 文档索引
-
-- [Hermes NAS 部署](references/deployment-hermes.md)
-- [本地运行边界](references/deployment-local.md)
-- [V5 架构](references/architecture.md)
-- [状态机与事务](references/state-machine.md)
-- [候选选择](references/candidate-selection.md)
-- [恢复策略](references/recovery.md)
-- [升级与回滚](docs/V5-UPGRADE.md)
-- [V5 变更记录](CHANGELOG-V5.md)
-- [Skill 操作契约](SKILL.md)
-
-服务适配文档位于 `references/`：MoviePilot、115、LitePan 和 Emby 各自独立说明。
+---
 
 ## 项目结构
 
-| 路径 | 内容 |
+| 路径 | 说明 |
 | --- | --- |
-| `scripts/pipeline/` | 状态机、服务适配、资格与库存门禁、季度资源准备 |
-| `scripts/tests/` | 隔离测试和回归用例 |
-| `scripts/run_pipeline.py` | 通用 Python CLI |
+| `scripts/pipeline/` | 核心状态机、服务适配、资格与范围隔离、库存归属、Season 平铺、剧照补全与季度资源协调 |
+| `scripts/run_pipeline.py` | V5 通用 Python CLI 入口 |
+| `scripts/v5_bootstrap.py` / `scripts/v5_plugin_secret.py` | 独立运行环境的只读凭据引导模块 |
 | `scripts/hermes_runtime.py` | Hermes 部署入口与环境边界 |
-| `deploy/` | 安装、验证、回滚工具及配置样例 |
-| `references/`、`docs/V5-UPGRADE.md` | 操作契约和升级说明 |
-| `SKILL.md` | Agent 使用入口 |
+| `scripts/tests/` | 隔离单元测试与回归套件 |
+| `deploy/` | 交付打包、安装、回滚工具与脱敏配置样例 |
+| `references/`、`docs/V5-UPGRADE.md` | 架构、状态机、季度资源契约、恢复策略与部署文档 |
+| `CHANGELOG-V5.md` | V5 版本变更与验证边界记录 |
+| `SKILL.md` | Agent 操作契约 |
 
-真实配置、部署记录、账户数据和运行日志放在仓库外；配置样例仅使用占位值。
+---
 
-## 安全边界
+## 安全与运维边界
 
-- 不提交或输出 Cookie、Token、API Key、播放地址、运行时 ID 或真实服务地址。
-- 环境文件必须是普通文件，不得是符号链接，且权限不得宽于 `0600`。
-- 对远端文件清单不完整、身份不确定或路径证据不足的情况，停止自动推进并进入 review。
-- 代码回滚必须与匹配的 SQLite 备份作为同一个 release 单元处理。
-- 任何真实写入前，先保存审计证据并确认当前调度器只有一个所有者。
+- **零凭据入库**：严禁在 Git、日志、报告或状态库中记录 Cookie、Token、API Key、播放地址或真实内部服务地址。
+- **单一调度所有权**：沿用既有唯一 NAS cron 或原生 agent 定时任务，禁止新增第二套轮询或进程内 `sleep` 等待循环。
+- **证据驱动完成判定**：HTTP 200、磁链已提交或单个 STRM 存在均不代表入库完成；必须同时核验云盘路径、STRM 内容一致性、侧车元数据与 Emby 精确身份路径。
+- **故障即停与成对回滚**：库存未知、路径越界或身份冲突时立即阻断；代码回滚须与对应 SQLite 备份成对处理。
