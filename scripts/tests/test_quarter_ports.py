@@ -124,6 +124,24 @@ class QuarterPortsTests(unittest.TestCase):
         self.assertFalse(task['sync_metadata'])
         self.assertNotIn('paths.cloud_library_root', layout['patch'])
 
+    def test_layout_maps_chinese_emby_display_names_for_all_quarters(self):
+        cases = (
+            (datetime(2026, 1, 15), "2026-01", "2026-01月新番", "一月新番"),
+            (datetime(2026, 4, 15), "2026-04", "2026-04月新番", "四月新番"),
+            (datetime(2026, 7, 15), "2026-07", "2026-07月新番", "七月新番"),
+            (datetime(2026, 10, 28), "2026-10", "2026-10月新番", "十月新番"),
+            (datetime(2027, 1, 15), "2027-01", "2027-01月新番", "一月新番"),
+        )
+        for now, quarter, dir_label, emby_name in cases:
+            with self.subTest(quarter=quarter), patch("pipeline.quarter_layout.datetime") as clock:
+                clock.now.return_value = now
+                layout = build_layout({}, self.config)
+            self.assertEqual(layout["quarter"], quarter)
+            self.assertEqual(layout["patch"]["runtime.emby_library_name"], emby_name)
+            self.assertEqual(layout["targets"]["emby_library"], emby_name)
+            self.assertEqual(layout["emby_library"], {"name": emby_name, "path": f"/media/追番/{dir_label}"})
+            self.assertEqual(layout["patch"]["runtime.emby_library_root"], f"/media/追番/{dir_label}")
+
     def test_complete_anchor_binding_and_plan_inventory_do_not_write(self):
         before = self.db.read_bytes()
         files_before = sorted(str(p.relative_to(self.root)) for p in self.root.rglob('*'))

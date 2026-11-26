@@ -7,14 +7,24 @@ from zoneinfo import ZoneInfo
 
 from .paths import PathMapper, season_label_from_air_date
 
+_EMBY_QUARTER_DISPLAY_NAMES = {
+    "01": "一月新番",
+    "04": "四月新番",
+    "07": "七月新番",
+    "10": "十月新番",
+}
+
 
 def build_layout(raw_config, config):
     now = datetime.now(ZoneInfo("Asia/Shanghai"))
     label = season_label_from_air_date(now.date().isoformat())
-    # Library display names drop the year prefix ("十月新番") while every
-    # directory keeps the year-qualified label ("2026-10月新番").
-    emby_label = label.split("-", 1)[-1] if "-" in label else label
     quarter = label[:7]
+    # Library display names use the Chinese quarter month ("十月新番") while
+    # every directory keeps the year-qualified label ("2026-10月新番").
+    month_code = quarter.split("-", 1)[-1]
+    emby_label = _EMBY_QUARTER_DISPLAY_NAMES.get(
+        month_code, label.split("-", 1)[-1] if "-" in label else label
+    )
     paths = config.paths
     raw_base = paths.litepan_raw_output_root
     if not raw_base or not paths.cloud_library_subdir:
@@ -54,7 +64,7 @@ def build_layout(raw_config, config):
             "published_dir": published_dir,
             "litepan_task": task_name,
             "litepan_rule": event_name,
-            "emby_library": label,
+            "emby_library": emby_label,
         },
         "patch": patch,
         "cloud_library_root": paths.cloud_library_root,
@@ -72,7 +82,7 @@ def build_layout(raw_config, config):
             "name": event_name, "trigger_type": "webhook", "status": "running",
             "trigger_config": {"event": event_name, "source": config.runtime.litepan_event_source},
         },
-        "emby_library": {"name": label, "path": emby_dir},
+        "emby_library": {"name": emby_label, "path": emby_dir},
     }
 
 
