@@ -1,0 +1,68 @@
+{
+  "name": "dsh-anime-cloud-pipeline",
+  "version": "5.4.10",
+  "description": "DeepSeek Harness (DSH) 专用追番云媒体流水线插件：内置只读门禁、番剧进度查询、受控快照推进、上下文引导与 Web 控制面板（MoviePilot → 115 → LitePan STRM → Emby）。",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./client": "./lib/client.js",
+    "./runner": "./lib/runner.js"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "deploy",
+    "references",
+    "docs",
+    "tests",
+    "cordis.patch.yml",
+    "SKILL.md",
+    "CHANGELOG-V5.md",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "node --test tests/*.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "anime",
+    "moviepilot",
+    "p115",
+    "litepan",
+    "emby"
+  ],
+  "author": "xieqiong111",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xieqiong111/anime-cloud-pipeline.git"
+  },
+  "homepage": "https://github.com/xieqiong111/anime-cloud-pipeline#readme",
+  "bugs": {
+    "url": "https://github.com/xieqiong111/anime-cloud-pipeline/issues"
+  }
+}

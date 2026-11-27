@@ -1,0 +1,4 @@
+# dsh-anime-cloud-pipeline bundle patch: inject plugin into the DSH profile.
+- insert:
+    - id: anime-cloud-pipeline
+      name: 'dsh-anime-cloud-pipeline'

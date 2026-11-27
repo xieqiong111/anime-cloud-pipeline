@@ -63,6 +63,27 @@ discovered → download_pending → submitted → cloud_ready
 
 ---
 
+## 快速开始（作为 DeepSeek Harness 专用插件安装）
+
+本仓库本身也是一个零外部 npm 依赖的 **DSH（DeepSeek Harness）原生插件**（包名 `dsh-anime-cloud-pipeline`，Node `>=22.13.0`）。
+
+1. **在 DSH profile 目录安装插件**（例如 `~/.dsh/profiles/web` 或容器内 `/data/dsh/profiles/web`）：
+   ```sh
+   pnpm add github:xieqiong111/anime-cloud-pipeline
+   ```
+   或将仓库克隆到本地后使用 `link:<仓库路径>` 引入。
+2. **启用 bundle**：在同一个 `package.json` 的 `dsh.profile.bundles` 数组中加入 `"dsh-anime-cloud-pipeline"`，重启 DSH。
+3. **插件提供的能力**：
+   - **4 个内置 Agent 工具**：
+     - `anime_pipeline_preflight`：一键跑通只读门禁（环境、数据库版本、订阅资格、范围隔离、8 项季度资源与带番名试运行）。
+     - `anime_pipeline_status`：查询当前季度各番剧中文名称、逐集入库进度与范围外复核统计。
+     - `anime_pipeline_run`：先校验全部只读门禁，仅在显式 `confirmWrite=true` 时推进一轮有界快照（支持 `resumeOnly`；绝不自动解除 `needs_review` 或创建季度资源）。
+     - `anime_pipeline_logs`：读取每日自动运行自然语言报告（`.dsh/logs/YYYY-MM-DD.md`）。
+   - **按需上下文引导**：仅当对话涉及追番 / Emby / 115 / V5 流水线时注入操作规范，要求模型用自然中文 + Markdown 表格 + 具体番名汇报。
+   - **Web 设置页「追番流水线」**：在 DSH 设置 → 插件 → **追番流水线** 中可查看季度资源与各番剧进度、浏览每日运行报告、触发只读巡检或受控推进，并管理 `$DSH_HOME/anime-cloud-pipeline.json`（权限 `0600`，`wrapper` / `local` 双模式）。
+
+---
+
 ## 快速开始（Hermes Release 部署）
 
 以下 `<...>` 为占位符，执行前请替换为目标环境实际值：
@@ -141,6 +162,10 @@ OCTOP_PIPELINE_RESOURCE_REVISION="<plan-resources-config_revision>" \
 ## 本地测试
 
 ```sh
+# DSH 插件（Node >= 22.13）
+node --test tests/*.test.mjs
+
+# Python V5 核心
 python3.12 -m compileall -q scripts deploy
 PYTHONPATH=scripts python3.12 -m unittest discover -s scripts/tests -p 'test*.py'
 ```
@@ -153,6 +178,9 @@ PYTHONPATH=scripts python3.12 -m unittest discover -s scripts/tests -p 'test*.py
 
 | 路径 | 说明 |
 | --- | --- |
+| `package.json` / `cordis.patch.yml` | DSH 插件清单与 Cordis bundle 补丁 |
+| `lib/` | DSH 插件后端（`index.js`、`runner.js`）与 Web 设置页（`client.js`） |
+| `tests/` | DSH 插件 Node 单元测试（`node --test`） |
 | `scripts/pipeline/` | 核心状态机、服务适配、资格与范围隔离、库存归属、Season 平铺、剧照补全与季度资源协调 |
 | `scripts/run_pipeline.py` | V5 通用 Python CLI 入口 |
 | `scripts/v5_bootstrap.py` / `scripts/v5_plugin_secret.py` | 独立运行环境的只读凭据引导模块 |
